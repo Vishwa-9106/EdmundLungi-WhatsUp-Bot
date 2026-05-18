@@ -7,7 +7,6 @@ import os
 import json
 import re
 import logging
-from uuid import uuid4
 import httpx
 import uvicorn
 from contextlib import asynccontextmanager
@@ -27,6 +26,7 @@ WHATSAPP_PHONE_ID = os.environ.get("WHATSAPP_PHONE_ID")
 VERIFY_TOKEN      = os.environ.get("VERIFY_TOKEN", "edmund_lungis_verify_2024")
 CUSTOMER_PROFILE_TABLE = os.environ.get("CUSTOMER_PROFILE_TABLE", "whatsapp_users")
 AUTH_USERS_TABLE = "users"
+DEFAULT_WHATSAPP_USERS_TABLE = "whatsapp_users"
 
 GROQ_MODEL       = "llama-3.3-70b-versatile"
 WHATSAPP_API_URL = f"https://graph.facebook.com/v19.0/{WHATSAPP_PHONE_ID}/messages"
@@ -100,12 +100,26 @@ def fetch_profile_from_table(client: Client, table_name: str, mobile: str) -> di
     return record
 
 
-def fetch_customer_profile(client: Client, mobile: str) -> dict | None:
-    primary_tables = [AUTH_USERS_TABLE]
-    if CUSTOMER_PROFILE_TABLE != AUTH_USERS_TABLE:
-        primary_tables.append(CUSTOMER_PROFILE_TABLE)
+def get_profile_lookup_tables() -> list[str]:
+    tables = [AUTH_USERS_TABLE]
+    for table_name in [CUSTOMER_PROFILE_TABLE, DEFAULT_WHATSAPP_USERS_TABLE]:
+        if table_name and table_name not in tables:
+            tables.append(table_name)
+    return tables
 
-    for table_name in primary_tables:
+
+def get_registration_target_tables() -> list[str]:
+    targets = []
+    for table_name in [CUSTOMER_PROFILE_TABLE, DEFAULT_WHATSAPP_USERS_TABLE]:
+        if table_name == AUTH_USERS_TABLE:
+            continue
+        if table_name and table_name not in targets:
+            targets.append(table_name)
+    return targets
+
+
+def fetch_customer_profile(client: Client, mobile: str) -> dict | None:
+    for table_name in get_profile_lookup_tables():
         try:
             record = fetch_profile_from_table(client, table_name, mobile)
             if record:
@@ -133,22 +147,6 @@ def validate_profile(profile: dict) -> list[str]:
     return errors
 
 
-def build_users_table_payload(profile: dict) -> dict:
-    return {
-        "name": profile["name"],
-        "email": profile["email"],
-        "mobile": profile["mobile"],
-        "addresses": {
-            "default": {
-                "address": profile["address"],
-            }
-        },
-        "role": "user",
-        "no_of_orders": 0,
-        "wishlist": [],
-    }
-
-
 def build_users_update_payload(profile: dict) -> dict:
     return {
         "name": profile["name"],
@@ -162,9 +160,8 @@ def build_users_update_payload(profile: dict) -> dict:
     }
 
 
-def build_whatsapp_users_payload(profile: dict, generated_uuid: str) -> dict:
+def build_whatsapp_users_payload(profile: dict) -> dict:
     return {
-        "id": generated_uuid,
         "name": profile["name"],
         "email": profile["email"],
         "mobile": profile["mobile"],
@@ -185,14 +182,32 @@ def log_profile_save_attempt(profile: dict, payload: dict, generated_uuid: str |
     )
 
 
-def insert_customer_profile(client: Client, profile: dict) -> None:
-    generated_uuid = str(uuid4())
-    if CUSTOMER_PROFILE_TABLE == AUTH_USERS_TABLE:
-        raise ValueError("Direct insert into public.users is disabled for WhatsApp-only customers.")
+def insert_customer_profile(client: Client, profile: dict) -> str:
+    target_tables = get_registration_target_tables()
+    if not target_tables:
+        raise ValueError(
+            "No non-auth customer profile table is configured. "
+            "WhatsApp registrations cannot be inserted into public.users directly."
+        )
 
-    payload = build_whatsapp_users_payload(profile, generated_uuid)
-    log_profile_save_attempt(profile, payload, generated_uuid, CUSTOMER_PROFILE_TABLE)
-    client.table(CUSTOMER_PROFILE_TABLE).insert(payload).execute()
+    payload = build_whatsapp_users_payload(profile)
+    last_error = None
+    for target_table in target_tables:
+        try:
+            log_profile_save_attempt(profile, payload, None, target_table)
+            client.table(target_table).insert(payload).execute()
+            return target_table
+        except Exception as e:
+            last_error = e
+            logger.error(
+                "Profile insert failed in table %s for %s: %s | payload=%s",
+                target_table,
+                profile.get("mobile"),
+                e,
+                payload,
+            )
+
+    raise last_error if last_error else RuntimeError("Profile insert failed")
 
 
 def update_customer_profile(client: Client, source_table: str, mobile: str, profile: dict) -> None:
@@ -367,6 +382,7 @@ def build_registration_completion_message(name: str = "") -> str:
 
 
 def create_onboarding_session(user: dict | None, mobile: str, pending_query: str | None) -> dict:
+    registration_targets = get_registration_target_tables()
     missing_fields = get_missing_profile_fields(user)
     profile = {
         "name": str(user.get("name", "") or "").strip() if user else "",
@@ -377,7 +393,7 @@ def create_onboarding_session(user: dict | None, mobile: str, pending_query: str
     session = {
         "mobile": mobile,
         "user_id": user.get("id") if user else None,
-        "source_table": user.get("_source_table") if user else CUSTOMER_PROFILE_TABLE,
+        "source_table": user.get("_source_table") if user else (registration_targets[0] if registration_targets else CUSTOMER_PROFILE_TABLE),
         "is_new_user": user is None,
         "pending_query": pending_query,
         "missing_fields": missing_fields,
@@ -668,7 +684,7 @@ async def complete_registration(session: dict) -> bool:
                     profile,
                 )
             else:
-                insert_customer_profile(client, profile)
+                session["source_table"] = insert_customer_profile(client, profile)
             onboarding_sessions.pop(session["mobile"], None)
             return True
         except Exception as e:
