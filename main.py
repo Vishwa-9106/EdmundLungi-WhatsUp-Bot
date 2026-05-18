@@ -7,6 +7,7 @@ import os
 import json
 import re
 import logging
+from uuid import uuid4
 import httpx
 import uvicorn
 from contextlib import asynccontextmanager
@@ -24,6 +25,8 @@ GROQ_API_KEY      = os.environ.get("GROQ_API_KEY")
 WHATSAPP_TOKEN    = os.environ.get("WHATSAPP_TOKEN")
 WHATSAPP_PHONE_ID = os.environ.get("WHATSAPP_PHONE_ID")
 VERIFY_TOKEN      = os.environ.get("VERIFY_TOKEN", "edmund_lungis_verify_2024")
+CUSTOMER_PROFILE_TABLE = os.environ.get("CUSTOMER_PROFILE_TABLE", "whatsapp_users")
+AUTH_USERS_TABLE = "users"
 
 GROQ_MODEL       = "llama-3.3-70b-versatile"
 WHATSAPP_API_URL = f"https://graph.facebook.com/v19.0/{WHATSAPP_PHONE_ID}/messages"
@@ -55,7 +58,7 @@ groq_client      = None
 FRIENDLY_RETRY_MESSAGE = "Please try sending that once again 👍"
 FRIENDLY_REPHRASE_MESSAGE = "Could you please rephrase that 😊"
 REGISTRATION_SAVE_RETRY_MESSAGE = (
-    "Sorry, I couldn't save your details right now 😊\n"
+    "Sorry, we couldn't complete profile setup right now 😊\n"
     "Please try again in a moment."
 )
 REGISTRATION_RETRYING_MESSAGE = (
@@ -76,13 +79,50 @@ def fetch_active_products(client: Client) -> list[dict]:
     return response.data
 
 
-def fetch_user_by_mobile(client: Client, mobile: str) -> dict | None:
-    response = client.table("users").select("*").eq("mobile", mobile).limit(1).execute()
-    return response.data[0] if response.data else None
+def fetch_profile_from_table(client: Client, table_name: str, mobile: str) -> dict | None:
+    response = client.table(table_name).select("*").eq("mobile", mobile).limit(1).execute()
+    if not response.data:
+        return None
+    record = response.data[0]
+    record["_source_table"] = table_name
+    return record
 
 
-def insert_user_profile(client: Client, profile: dict) -> None:
-    payload = {
+def fetch_customer_profile(client: Client, mobile: str) -> dict | None:
+    primary_tables = [CUSTOMER_PROFILE_TABLE]
+    if CUSTOMER_PROFILE_TABLE != AUTH_USERS_TABLE:
+        primary_tables.append(AUTH_USERS_TABLE)
+
+    for table_name in primary_tables:
+        try:
+            record = fetch_profile_from_table(client, table_name, mobile)
+            if record:
+                return record
+        except Exception as e:
+            logger.error("Profile lookup failed in table %s for %s: %s", table_name, mobile, e)
+    return None
+
+
+def validate_profile(profile: dict) -> list[str]:
+    errors = []
+    name = str(profile.get("name", "") or "").strip()
+    email = str(profile.get("email", "") or "").strip()
+    mobile = str(profile.get("mobile", "") or "").strip()
+    address = str(profile.get("address", "") or "").strip()
+
+    if not is_valid_name(name):
+        errors.append("invalid_name")
+    if not is_valid_email(email):
+        errors.append("invalid_email")
+    if not mobile:
+        errors.append("missing_mobile")
+    if not address:
+        errors.append("missing_address")
+    return errors
+
+
+def build_users_table_payload(profile: dict) -> dict:
+    return {
         "name": profile["name"],
         "email": profile["email"],
         "mobile": profile["mobile"],
@@ -95,28 +135,74 @@ def insert_user_profile(client: Client, profile: dict) -> None:
         "no_of_orders": 0,
         "wishlist": [],
     }
-    client.table("users").insert(payload).execute()
 
 
-def update_user_profile(client: Client, mobile: str, profile: dict) -> None:
-    payload = {}
-    if profile.get("name"):
-        payload["name"] = profile["name"]
-    if profile.get("email"):
-        payload["email"] = profile["email"]
-    if profile.get("address"):
-        payload["addresses"] = {
+def build_users_update_payload(profile: dict) -> dict:
+    return {
+        "name": profile["name"],
+        "email": profile["email"],
+        "mobile": profile["mobile"],
+        "addresses": {
             "default": {
                 "address": profile["address"],
             }
+        },
+    }
+
+
+def build_whatsapp_users_payload(profile: dict, generated_uuid: str) -> dict:
+    return {
+        "id": generated_uuid,
+        "name": profile["name"],
+        "email": profile["email"],
+        "mobile": profile["mobile"],
+        "address": profile["address"],
+    }
+
+
+def log_profile_save_attempt(profile: dict, payload: dict, generated_uuid: str | None, target_table: str) -> None:
+    logger.info(
+        "Preparing profile save | table=%s | extracted_name=%s | extracted_email=%s | extracted_mobile=%s | extracted_address=%s | generated_uuid=%s | final_insert_payload=%s",
+        target_table,
+        profile.get("name"),
+        profile.get("email"),
+        profile.get("mobile"),
+        profile.get("address"),
+        generated_uuid,
+        payload,
+    )
+
+
+def insert_customer_profile(client: Client, profile: dict) -> None:
+    generated_uuid = str(uuid4())
+    if CUSTOMER_PROFILE_TABLE == AUTH_USERS_TABLE:
+        raise ValueError("Direct insert into public.users is disabled for WhatsApp-only customers.")
+
+    payload = build_whatsapp_users_payload(profile, generated_uuid)
+    log_profile_save_attempt(profile, payload, generated_uuid, CUSTOMER_PROFILE_TABLE)
+    client.table(CUSTOMER_PROFILE_TABLE).insert(payload).execute()
+
+
+def update_customer_profile(client: Client, source_table: str, mobile: str, profile: dict) -> None:
+    if source_table == AUTH_USERS_TABLE:
+        payload = build_users_update_payload(profile)
+    else:
+        payload = {
+            "name": profile["name"],
+            "email": profile["email"],
+            "mobile": profile["mobile"],
+            "address": profile["address"],
         }
-    if payload:
-        client.table("users").update(payload).eq("mobile", mobile).execute()
+    log_profile_save_attempt(profile, payload, None, source_table)
+    client.table(source_table).update(payload).eq("mobile", mobile).execute()
 
 
 def extract_default_address(user: dict | None) -> str:
     if not user:
         return ""
+    plain_address = str(user.get("address", "") or "").strip()
+    if plain_address:
+        return plain_address
     addresses = user.get("addresses")
     if isinstance(addresses, dict):
         default_address = addresses.get("default", {})
@@ -198,6 +284,7 @@ def create_onboarding_session(user: dict | None, mobile: str, pending_query: str
     session = {
         "mobile": mobile,
         "user_id": user.get("id") if user else None,
+        "source_table": user.get("_source_table") if user else CUSTOMER_PROFILE_TABLE,
         "is_new_user": user is None,
         "pending_query": pending_query,
         "missing_fields": missing_fields,
@@ -465,15 +552,24 @@ async def send_ai_product_response(to: str, user_text: str):
 async def complete_registration(session: dict) -> bool:
     client = get_supabase_client()
     profile = session["profile"]
+    validation_errors = validate_profile(profile)
+    if validation_errors:
+        logger.error("Profile validation failed for %s: %s | profile=%s", session["mobile"], validation_errors, profile)
+        return False
     try:
         if session.get("user_id"):
-            update_user_profile(client, session["mobile"], profile)
+            update_customer_profile(
+                client,
+                session.get("source_table") or AUTH_USERS_TABLE,
+                session["mobile"],
+                profile,
+            )
         else:
-            insert_user_profile(client, profile)
+            insert_customer_profile(client, profile)
         onboarding_sessions.pop(session["mobile"], None)
         return True
     except Exception as e:
-        logger.error("Registration save failed for %s: %s", session["mobile"], e)
+        logger.error("Registration save failed for %s: %s | profile=%s", session["mobile"], e, profile)
         return False
 
 
@@ -634,7 +730,7 @@ async def receive_message(request: Request):
         logger.info(f"Message: {user_text}")
 
         client = get_supabase_client()
-        user = fetch_user_by_mobile(client, from_number)
+        user = fetch_customer_profile(client, from_number)
         pending_session = onboarding_sessions.get(from_number)
 
         if pending_session:
