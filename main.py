@@ -36,6 +36,18 @@ logger = logging.getLogger(__name__)
 
 product_context  = ""
 products_list    = []   # Full product list with image_url
+
+ORDER_FOLLOW_UP_MESSAGE = (
+    "🛒 To place an order, please send:\n"
+    "• Product name\n"
+    "• Size needed\n"
+    "• Quantity\n\n"
+    "Example:\n"
+    "Black Dhoti with Gold Border\n"
+    "Size: Large\n"
+    "Quantity: 2\n\n"
+    "Our team will assist you further 😊"
+)
 groq_client      = None
 
 # ============================================================
@@ -271,6 +283,10 @@ async def send_product_responses(to: str, ai_response: dict):
     # Step 3: Send footer message
     if footer:
         await send_text_message(to, footer)
+
+    # Step 4: Send one order follow-up after the full product listing
+    if products:
+        await send_text_message(to, ORDER_FOLLOW_UP_MESSAGE)
 
 
 # ============================================================
