@@ -52,6 +52,17 @@ ORDER_FOLLOW_UP_MESSAGE = (
 )
 groq_client      = None
 
+FRIENDLY_RETRY_MESSAGE = "Please try sending that once again 👍"
+FRIENDLY_REPHRASE_MESSAGE = "Could you please rephrase that 😊"
+REGISTRATION_SAVE_RETRY_MESSAGE = (
+    "Sorry, I couldn't save your details right now 😊\n"
+    "Please try again in a moment."
+)
+REGISTRATION_RETRYING_MESSAGE = (
+    "Your details were received 👍\n"
+    "We are retrying the registration process."
+)
+
 # ============================================================
 # SUPABASE
 # ============================================================
@@ -140,6 +151,22 @@ def is_valid_email(email: str) -> bool:
 def is_greeting_message(message: str) -> bool:
     greetings = {"hi", "hello", "hey", "start", "helo", "vanakkam", "hai", "hii"}
     return message.strip().lower() in greetings
+
+
+def normalize_name(name: str) -> str:
+    cleaned = re.sub(r"\s+", " ", name).strip()
+    cleaned = re.sub(r"^(my name is|i am|i'm|im)\s+", "", cleaned, flags=re.IGNORECASE)
+    return cleaned.strip(" ,.-")
+
+
+def normalize_email(email: str) -> str:
+    return email.strip().lower()
+
+
+def normalize_address(address: str) -> str:
+    cleaned = address.strip()
+    cleaned = re.sub(r"^(my address is|address is|address)\s*[:,-]?\s*", "", cleaned, flags=re.IGNORECASE)
+    return cleaned.strip()
 
 
 def get_onboarding_prompt(field: str, is_new_user: bool = False) -> str:
@@ -282,44 +309,53 @@ def get_ai_response_json(user_message: str) -> dict:
             "products": [],
             "footer": ""
         }
-    try:
-        response = groq_client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": f"PRODUCT CATALOG:\n{product_context}\n\nCUSTOMER QUERY: {user_message}"
+    raw = ""
+    for attempt in range(2):
+        try:
+            response = groq_client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": f"PRODUCT CATALOG:\n{product_context}\n\nCUSTOMER QUERY: {user_message}"
+                    }
+                ],
+                max_tokens=1000,
+                temperature=0.3,
+            )
+            raw = response.choices[0].message.content.strip()
+
+            # Clean JSON if wrapped in markdown
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+            raw = raw.strip()
+
+            return json.loads(raw)
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON parse error on attempt {attempt + 1}: {e} | Raw: {raw}")
+            if attempt == 1:
+                return {
+                    "message": FRIENDLY_REPHRASE_MESSAGE,
+                    "products": [],
+                    "footer": ""
                 }
-            ],
-            max_tokens=1000,
-            temperature=0.3,
-        )
-        raw = response.choices[0].message.content.strip()
+        except Exception as e:
+            logger.error(f"Groq API error on attempt {attempt + 1}: {e}")
+            if attempt == 1:
+                return {
+                    "message": "Sorry, I couldn't process that properly 😊",
+                    "products": [],
+                    "footer": ""
+                }
 
-        # Clean JSON if wrapped in markdown
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        raw = raw.strip()
-
-        return json.loads(raw)
-
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON parse error: {e} | Raw: {raw}")
-        return {
-            "message": "Sorry, I couldn't process your request. Please try again! 🙏",
-            "products": [],
-            "footer": ""
-        }
-    except Exception as e:
-        logger.error(f"Groq API error: {e}")
-        return {
-            "message": "Sorry, I couldn't process your request. Please try again! 🙏",
-            "products": [],
-            "footer": ""
-        }
+    return {
+        "message": FRIENDLY_RETRY_MESSAGE,
+        "products": [],
+        "footer": ""
+    }
 
 
 # ============================================================
@@ -426,16 +462,19 @@ async def send_ai_product_response(to: str, user_text: str):
     await send_product_responses(to, ai_response)
 
 
-async def complete_registration(session: dict) -> None:
+async def complete_registration(session: dict) -> bool:
     client = get_supabase_client()
     profile = session["profile"]
-
-    if session.get("user_id"):
-        update_user_profile(client, session["mobile"], profile)
-    else:
-        insert_user_profile(client, profile)
-
-    onboarding_sessions.pop(session["mobile"], None)
+    try:
+        if session.get("user_id"):
+            update_user_profile(client, session["mobile"], profile)
+        else:
+            insert_user_profile(client, profile)
+        onboarding_sessions.pop(session["mobile"], None)
+        return True
+    except Exception as e:
+        logger.error("Registration save failed for %s: %s", session["mobile"], e)
+        return False
 
 
 async def process_onboarding_step(from_number: str, user_text: str, session: dict) -> dict:
@@ -443,27 +482,34 @@ async def process_onboarding_step(from_number: str, user_text: str, session: dic
     cleaned_text = user_text.strip()
 
     if current_field == "name":
-        if not is_valid_name(cleaned_text):
+        normalized_name = normalize_name(cleaned_text)
+        if not is_valid_name(normalized_name):
             await send_text_message(from_number, "Please share your full name 😊")
             return {"status": "awaiting_name"}
-        session["profile"]["name"] = re.sub(r"\s+", " ", cleaned_text)
+        session["profile"]["name"] = normalized_name
     elif current_field == "email":
-        if not is_valid_email(cleaned_text):
-            await send_text_message(from_number, "That email seems invalid. Please enter a valid email address 😊")
+        normalized_email = normalize_email(cleaned_text)
+        if not is_valid_email(normalized_email):
+            await send_text_message(from_number, "Please share a valid email address 😊")
             return {"status": "awaiting_email"}
-        session["profile"]["email"] = cleaned_text
+        session["profile"]["email"] = normalized_email
     elif current_field == "address":
-        if len(cleaned_text) < 8:
+        normalized_address = normalize_address(cleaned_text)
+        if len(normalized_address) < 5:
             await send_text_message(from_number, "Please share your delivery address for future orders 🚚")
             return {"status": "awaiting_address"}
-        session["profile"]["address"] = cleaned_text
+        session["profile"]["address"] = normalized_address
 
     next_field = advance_onboarding_session(session)
     if next_field:
         await send_text_message(from_number, get_onboarding_prompt(next_field))
         return {"status": f"awaiting_{next_field}"}
 
-    await complete_registration(session)
+    registration_saved = await complete_registration(session)
+    if not registration_saved:
+        await send_text_message(from_number, REGISTRATION_SAVE_RETRY_MESSAGE)
+        return {"status": "registration_save_retry_needed"}
+
     await send_text_message(from_number, build_registration_completion_message())
 
     pending_query = session.get("pending_query")
@@ -617,38 +663,10 @@ async def receive_message(request: Request):
         await send_ai_product_response(from_number, user_text)
         return {"status": "message_processed"}
 
-        # Handle greetings
-        greetings = ["hi", "hello", "hey", "start", "helo", "vanakkam", "hai", "hii"]
-        if user_text.lower() in greetings:
-            welcome = (
-                "👋 Welcome to *Edmund Lungis*!\n\n"
-                "I'm your AI shopping assistant for traditional Indian wear. 🎽\n\n"
-                "Try asking:\n"
-                "• _show white dhoti_\n"
-                "• _cotton lungi under 500_\n"
-                "• _wedding veshti_\n"
-                "• _silk dhoti_\n"
-                "• _daily wear lungi_\n\n"
-                "What are you looking for? 🛒"
-            )
-            await send_text_message(from_number, welcome)
-            return {"status": "greeting_sent"}
-
-        # Get AI response with product data
-        ai_response = get_ai_response_json(user_text)
-        logger.info(f"AI Response: {ai_response}")
-
-        # Send products with images
-        await send_product_responses(from_number, ai_response)
-
-        return {"status": "message_processed"}
-
     except Exception as e:
         logger.error(f"Webhook error: {e}")
-        await send_text_message(
-            from_number if 'from_number' in locals() else "",
-            "Sorry, something went wrong. Please try again! 🙏"
-        )
+        if "from_number" in locals() and from_number:
+            await send_text_message(from_number, "Sorry, I couldn't process that properly 😊")
         return {"status": "error", "detail": str(e)}
 
 
