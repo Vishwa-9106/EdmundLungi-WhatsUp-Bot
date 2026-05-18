@@ -66,6 +66,18 @@ REGISTRATION_RETRYING_MESSAGE = (
     "We are retrying the registration process."
 )
 
+ONBOARDING_BULK_PROMPT = (
+    "Welcome to Edmund Lungis 😊\n\n"
+    "Before we continue, please share the following details in one message:\n\n"
+    "👤 Name:\n"
+    "📧 Email:\n"
+    "🏠 Address:\n\n"
+    "Example:\n\n"
+    "Name: Rajesh Kumar\n"
+    "Email: rajesh@gmail.com\n"
+    "Address: 12 Gandhi Street, Chennai - 600001"
+)
+
 # ============================================================
 # SUPABASE
 # ============================================================
@@ -89,9 +101,9 @@ def fetch_profile_from_table(client: Client, table_name: str, mobile: str) -> di
 
 
 def fetch_customer_profile(client: Client, mobile: str) -> dict | None:
-    primary_tables = [CUSTOMER_PROFILE_TABLE]
+    primary_tables = [AUTH_USERS_TABLE]
     if CUSTOMER_PROFILE_TABLE != AUTH_USERS_TABLE:
-        primary_tables.append(AUTH_USERS_TABLE)
+        primary_tables.append(CUSTOMER_PROFILE_TABLE)
 
     for table_name in primary_tables:
         try:
@@ -255,10 +267,28 @@ def normalize_address(address: str) -> str:
     return cleaned.strip()
 
 
+def extract_profile_details(message: str) -> dict:
+    extracted = {"name": "", "email": "", "address": ""}
+    text = message.strip()
+
+    name_match = re.search(r"(?im)^\s*(?:👤\s*)?name\s*:\s*(.+)$", text)
+    email_match = re.search(r"(?im)^\s*(?:📧\s*)?email\s*:\s*([^\n]+)$", text)
+    address_match = re.search(r"(?ims)^\s*(?:🏠\s*)?address\s*:\s*(.+)$", text)
+
+    if name_match:
+        extracted["name"] = normalize_name(name_match.group(1))
+    if email_match:
+        extracted["email"] = normalize_email(email_match.group(1))
+    if address_match:
+        extracted["address"] = normalize_address(address_match.group(1))
+
+    return extracted
+
+
 def get_onboarding_prompt(field: str, is_new_user: bool = False) -> str:
     if field == "name":
         if is_new_user:
-            return "Welcome to Edmund Lungis 😊\nBefore we continue, may I get your name?"
+            return ONBOARDING_BULK_PROMPT
         return "Please share your full name 😊"
     if field == "email":
         return "Thank you 👍\nPlease share your email address."
@@ -290,6 +320,7 @@ def create_onboarding_session(user: dict | None, mobile: str, pending_query: str
         "missing_fields": missing_fields,
         "current_step_index": 0,
         "profile": profile,
+        "bulk_collection_pending": user is None and missing_fields == ["name", "email", "address"],
     }
     onboarding_sessions[mobile] = session
     return session
@@ -574,32 +605,53 @@ async def complete_registration(session: dict) -> bool:
 
 
 async def process_onboarding_step(from_number: str, user_text: str, session: dict) -> dict:
-    current_field = get_current_onboarding_field(session)
     cleaned_text = user_text.strip()
 
-    if current_field == "name":
-        normalized_name = normalize_name(cleaned_text)
-        if not is_valid_name(normalized_name):
-            await send_text_message(from_number, "Please share your full name 😊")
-            return {"status": "awaiting_name"}
-        session["profile"]["name"] = normalized_name
-    elif current_field == "email":
-        normalized_email = normalize_email(cleaned_text)
-        if not is_valid_email(normalized_email):
-            await send_text_message(from_number, "Please share a valid email address 😊")
-            return {"status": "awaiting_email"}
-        session["profile"]["email"] = normalized_email
-    elif current_field == "address":
-        normalized_address = normalize_address(cleaned_text)
-        if len(normalized_address) < 5:
-            await send_text_message(from_number, "Please share your delivery address for future orders 🚚")
-            return {"status": "awaiting_address"}
-        session["profile"]["address"] = normalized_address
+    if session.get("bulk_collection_pending"):
+        extracted = extract_profile_details(cleaned_text)
+        if extracted["name"]:
+            session["profile"]["name"] = extracted["name"]
+        if extracted["email"]:
+            session["profile"]["email"] = extracted["email"]
+        if extracted["address"]:
+            session["profile"]["address"] = extracted["address"]
 
-    next_field = advance_onboarding_session(session)
-    if next_field:
-        await send_text_message(from_number, get_onboarding_prompt(next_field))
-        return {"status": f"awaiting_{next_field}"}
+        missing_fields = get_missing_profile_fields(session["profile"])
+        if missing_fields:
+            session["bulk_collection_pending"] = False
+            session["missing_fields"] = missing_fields
+            session["current_step_index"] = 0
+            await send_text_message(from_number, get_onboarding_prompt(missing_fields[0]))
+            return {"status": f"awaiting_{missing_fields[0]}"}
+
+        session["missing_fields"] = []
+        session["current_step_index"] = 0
+    else:
+        current_field = get_current_onboarding_field(session)
+
+        if current_field == "name":
+            normalized_name = normalize_name(cleaned_text)
+            if not is_valid_name(normalized_name):
+                await send_text_message(from_number, "Please share your full name 😊")
+                return {"status": "awaiting_name"}
+            session["profile"]["name"] = normalized_name
+        elif current_field == "email":
+            normalized_email = normalize_email(cleaned_text)
+            if not is_valid_email(normalized_email):
+                await send_text_message(from_number, "Please share a valid email address 😊")
+                return {"status": "awaiting_email"}
+            session["profile"]["email"] = normalized_email
+        elif current_field == "address":
+            normalized_address = normalize_address(cleaned_text)
+            if len(normalized_address) < 5:
+                await send_text_message(from_number, "Please share your delivery address 😊")
+                return {"status": "awaiting_address"}
+            session["profile"]["address"] = normalized_address
+
+        next_field = advance_onboarding_session(session)
+        if next_field:
+            await send_text_message(from_number, get_onboarding_prompt(next_field))
+            return {"status": f"awaiting_{next_field}"}
 
     registration_saved = await complete_registration(session)
     if not registration_saved:
@@ -741,7 +793,7 @@ async def receive_message(request: Request):
 
         if user is None:
             create_onboarding_session(None, from_number, pending_query)
-            await send_text_message(from_number, get_onboarding_prompt("name", is_new_user=True))
+            await send_text_message(from_number, ONBOARDING_BULK_PROMPT)
             return {"status": "new_user_onboarding_started"}
 
         missing_fields = get_missing_profile_fields(user)
