@@ -128,7 +128,7 @@ def validate_profile(profile: dict) -> list[str]:
         errors.append("invalid_email")
     if not mobile:
         errors.append("missing_mobile")
-    if not address:
+    if not is_valid_address(address):
         errors.append("missing_address")
     return errors
 
@@ -264,23 +264,84 @@ def normalize_email(email: str) -> str:
 def normalize_address(address: str) -> str:
     cleaned = address.strip()
     cleaned = re.sub(r"^(my address is|address is|address)\s*[:,-]?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"^(i live in|i am from|i'm from|from)\s+", "", cleaned, flags=re.IGNORECASE)
     return cleaned.strip()
+
+
+def is_valid_address(address: str) -> bool:
+    return len(address.strip()) >= 5
+
+
+def build_session_progress(profile: dict) -> dict:
+    name_collected = is_valid_name(str(profile.get("name", "") or "").strip())
+    email_collected = is_valid_email(str(profile.get("email", "") or "").strip())
+    address_collected = is_valid_address(str(profile.get("address", "") or "").strip())
+    return {
+        "name_collected": name_collected,
+        "email_collected": email_collected,
+        "address_collected": address_collected,
+        "profile_completed": name_collected and email_collected and address_collected,
+    }
+
+
+def refresh_session_state(session: dict) -> None:
+    progress = build_session_progress(session["profile"])
+    session.update(progress)
 
 
 def extract_profile_details(message: str) -> dict:
     extracted = {"name": "", "email": "", "address": ""}
     text = message.strip()
+    if not text:
+        return extracted
 
-    name_match = re.search(r"(?im)^\s*(?:👤\s*)?name\s*:\s*(.+)$", text)
-    email_match = re.search(r"(?im)^\s*(?:📧\s*)?email\s*:\s*([^\n]+)$", text)
-    address_match = re.search(r"(?ims)^\s*(?:🏠\s*)?address\s*:\s*(.+)$", text)
-
-    if name_match:
-        extracted["name"] = normalize_name(name_match.group(1))
+    email_match = re.search(r"([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})", text, re.IGNORECASE)
     if email_match:
         extracted["email"] = normalize_email(email_match.group(1))
+
+    name_match = re.search(r"(?im)^\s*(?:👤\s*)?name\s*:\s*(.+)$", text)
+    if not name_match:
+        name_match = re.search(r"(?im)\b(?:my name is|i am|i'm|im)\s+([A-Za-z][A-Za-z\s.'-]{1,})", text)
+    if name_match:
+        candidate = name_match.group(1).splitlines()[0]
+        extracted["name"] = normalize_name(candidate)
+
+    address_match = re.search(r"(?ims)^\s*(?:🏠\s*)?address\s*:\s*(.+)$", text)
+    if not address_match:
+        address_match = re.search(r"(?im)^\s*(?:i live in|i am from|i'm from|from)\s+(.+)$", text)
     if address_match:
         extracted["address"] = normalize_address(address_match.group(1))
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not extracted["name"]:
+        for line in lines:
+            lower_line = line.lower()
+            if "@" in line:
+                continue
+            if any(keyword in lower_line for keyword in ["address", "email", "mail id", "mail", "i live in", "from"]):
+                continue
+            candidate = normalize_name(line)
+            if is_valid_name(candidate):
+                extracted["name"] = candidate
+                break
+
+    if not extracted["address"]:
+        address_lines = []
+        for line in lines:
+            if extracted["email"] and extracted["email"] in line.lower():
+                continue
+            normalized_line = normalize_name(line)
+            if extracted["name"] and normalized_line == extracted["name"]:
+                continue
+            lower_line = line.lower()
+            if lower_line.startswith("name:") or lower_line.startswith("email:"):
+                continue
+            if "mail id" in lower_line:
+                continue
+            address_lines.append(line)
+
+        if address_lines:
+            extracted["address"] = normalize_address("\n".join(address_lines))
 
     return extracted
 
@@ -295,11 +356,13 @@ def get_onboarding_prompt(field: str, is_new_user: bool = False) -> str:
     return "Please share your delivery address for future orders 🚚"
 
 
-def build_registration_completion_message() -> str:
+def build_registration_completion_message(name: str = "") -> str:
+    customer_name = str(name or "").strip()
+    greeting = f"Thank you {customer_name} 😊" if customer_name else "Thank you 😊"
     return (
-        "Thank you 😊\n"
+        f"{greeting}\n"
         "Your profile has been created successfully.\n\n"
-        "You can now explore our premium lungis, dhotis, and traditional wear 🛍️"
+        "You can now explore our premium collections 🛍️"
     )
 
 
@@ -321,7 +384,12 @@ def create_onboarding_session(user: dict | None, mobile: str, pending_query: str
         "current_step_index": 0,
         "profile": profile,
         "bulk_collection_pending": user is None and missing_fields == ["name", "email", "address"],
+        "name_collected": False,
+        "email_collected": False,
+        "address_collected": False,
+        "profile_completed": False,
     }
+    refresh_session_state(session)
     onboarding_sessions[mobile] = session
     return session
 
@@ -587,21 +655,31 @@ async def complete_registration(session: dict) -> bool:
     if validation_errors:
         logger.error("Profile validation failed for %s: %s | profile=%s", session["mobile"], validation_errors, profile)
         return False
-    try:
-        if session.get("user_id"):
-            update_customer_profile(
-                client,
-                session.get("source_table") or AUTH_USERS_TABLE,
+    for attempt in range(2):
+        try:
+            existing_user = fetch_customer_profile(client, session["mobile"])
+            if existing_user:
+                session["user_id"] = existing_user.get("id")
+                session["source_table"] = existing_user.get("_source_table") or AUTH_USERS_TABLE
+                update_customer_profile(
+                    client,
+                    session["source_table"],
+                    session["mobile"],
+                    profile,
+                )
+            else:
+                insert_customer_profile(client, profile)
+            onboarding_sessions.pop(session["mobile"], None)
+            return True
+        except Exception as e:
+            logger.error(
+                "Registration save failed for %s on attempt %s: %s | profile=%s",
                 session["mobile"],
+                attempt + 1,
+                e,
                 profile,
             )
-        else:
-            insert_customer_profile(client, profile)
-        onboarding_sessions.pop(session["mobile"], None)
-        return True
-    except Exception as e:
-        logger.error("Registration save failed for %s: %s | profile=%s", session["mobile"], e, profile)
-        return False
+    return False
 
 
 async def process_onboarding_step(from_number: str, user_text: str, session: dict) -> dict:
@@ -616,16 +694,24 @@ async def process_onboarding_step(from_number: str, user_text: str, session: dic
         if extracted["address"]:
             session["profile"]["address"] = extracted["address"]
 
-        missing_fields = get_missing_profile_fields(session["profile"])
-        if missing_fields:
+        refresh_session_state(session)
+        if session.get("profile_completed"):
+            session["bulk_collection_pending"] = False
+            session["missing_fields"] = []
+            session["current_step_index"] = 0
+        else:
+            missing_fields = []
+            if not session.get("name_collected"):
+                missing_fields.append("name")
+            if not session.get("email_collected"):
+                missing_fields.append("email")
+            if not session.get("address_collected"):
+                missing_fields.append("address")
             session["bulk_collection_pending"] = False
             session["missing_fields"] = missing_fields
             session["current_step_index"] = 0
             await send_text_message(from_number, get_onboarding_prompt(missing_fields[0]))
             return {"status": f"awaiting_{missing_fields[0]}"}
-
-        session["missing_fields"] = []
-        session["current_step_index"] = 0
     else:
         current_field = get_current_onboarding_field(session)
 
@@ -643,11 +729,12 @@ async def process_onboarding_step(from_number: str, user_text: str, session: dic
             session["profile"]["email"] = normalized_email
         elif current_field == "address":
             normalized_address = normalize_address(cleaned_text)
-            if len(normalized_address) < 5:
+            if not is_valid_address(normalized_address):
                 await send_text_message(from_number, "Please share your delivery address 😊")
                 return {"status": "awaiting_address"}
             session["profile"]["address"] = normalized_address
 
+        refresh_session_state(session)
         next_field = advance_onboarding_session(session)
         if next_field:
             await send_text_message(from_number, get_onboarding_prompt(next_field))
@@ -658,7 +745,10 @@ async def process_onboarding_step(from_number: str, user_text: str, session: dic
         await send_text_message(from_number, REGISTRATION_SAVE_RETRY_MESSAGE)
         return {"status": "registration_save_retry_needed"}
 
-    await send_text_message(from_number, build_registration_completion_message())
+    await send_text_message(
+        from_number,
+        build_registration_completion_message(session["profile"].get("name", "")),
+    )
 
     pending_query = session.get("pending_query")
     if pending_query:
