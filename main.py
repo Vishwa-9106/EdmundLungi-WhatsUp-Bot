@@ -5,6 +5,7 @@
 
 import os
 import json
+import re
 import logging
 import httpx
 import uvicorn
@@ -36,6 +37,7 @@ logger = logging.getLogger(__name__)
 
 product_context  = ""
 products_list    = []   # Full product list with image_url
+onboarding_sessions = {}
 
 ORDER_FOLLOW_UP_MESSAGE = (
     "🛒 To place an order, please send:\n"
@@ -61,6 +63,135 @@ def get_supabase_client() -> Client:
 def fetch_active_products(client: Client) -> list[dict]:
     response = client.table("products").select("*").eq("is_active", True).execute()
     return response.data
+
+
+def fetch_user_by_mobile(client: Client, mobile: str) -> dict | None:
+    response = client.table("users").select("*").eq("mobile", mobile).limit(1).execute()
+    return response.data[0] if response.data else None
+
+
+def insert_user_profile(client: Client, profile: dict) -> None:
+    payload = {
+        "name": profile["name"],
+        "email": profile["email"],
+        "mobile": profile["mobile"],
+        "addresses": {
+            "default": {
+                "address": profile["address"],
+            }
+        },
+        "role": "user",
+        "no_of_orders": 0,
+        "wishlist": [],
+    }
+    client.table("users").insert(payload).execute()
+
+
+def update_user_profile(client: Client, mobile: str, profile: dict) -> None:
+    payload = {}
+    if profile.get("name"):
+        payload["name"] = profile["name"]
+    if profile.get("email"):
+        payload["email"] = profile["email"]
+    if profile.get("address"):
+        payload["addresses"] = {
+            "default": {
+                "address": profile["address"],
+            }
+        }
+    if payload:
+        client.table("users").update(payload).eq("mobile", mobile).execute()
+
+
+def extract_default_address(user: dict | None) -> str:
+    if not user:
+        return ""
+    addresses = user.get("addresses")
+    if isinstance(addresses, dict):
+        default_address = addresses.get("default", {})
+        if isinstance(default_address, dict):
+            return str(default_address.get("address", "") or "").strip()
+    return ""
+
+
+def get_missing_profile_fields(user: dict | None) -> list[str]:
+    if not user:
+        return ["name", "email", "address"]
+
+    missing_fields = []
+    if not str(user.get("name", "") or "").strip():
+        missing_fields.append("name")
+    if not str(user.get("email", "") or "").strip():
+        missing_fields.append("email")
+    if not extract_default_address(user):
+        missing_fields.append("address")
+    return missing_fields
+
+
+def is_valid_name(name: str) -> bool:
+    cleaned = re.sub(r"\s+", " ", name).strip()
+    return len(cleaned) >= 2 and any(char.isalpha() for char in cleaned)
+
+
+def is_valid_email(email: str) -> bool:
+    return bool(re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", email.strip()))
+
+
+def is_greeting_message(message: str) -> bool:
+    greetings = {"hi", "hello", "hey", "start", "helo", "vanakkam", "hai", "hii"}
+    return message.strip().lower() in greetings
+
+
+def get_onboarding_prompt(field: str, is_new_user: bool = False) -> str:
+    if field == "name":
+        if is_new_user:
+            return "Welcome to Edmund Lungis 😊\nBefore we continue, may I get your name?"
+        return "Please share your full name 😊"
+    if field == "email":
+        return "Thank you 👍\nPlease share your email address."
+    return "Please share your delivery address for future orders 🚚"
+
+
+def build_registration_completion_message() -> str:
+    return (
+        "Thank you 😊\n"
+        "Your profile has been created successfully.\n\n"
+        "You can now explore our premium lungis, dhotis, and traditional wear 🛍️"
+    )
+
+
+def create_onboarding_session(user: dict | None, mobile: str, pending_query: str | None) -> dict:
+    missing_fields = get_missing_profile_fields(user)
+    profile = {
+        "name": str(user.get("name", "") or "").strip() if user else "",
+        "email": str(user.get("email", "") or "").strip() if user else "",
+        "address": extract_default_address(user),
+        "mobile": mobile,
+    }
+    session = {
+        "mobile": mobile,
+        "user_id": user.get("id") if user else None,
+        "is_new_user": user is None,
+        "pending_query": pending_query,
+        "missing_fields": missing_fields,
+        "current_step_index": 0,
+        "profile": profile,
+    }
+    onboarding_sessions[mobile] = session
+    return session
+
+
+def get_current_onboarding_field(session: dict) -> str | None:
+    missing_fields = session.get("missing_fields", [])
+    index = session.get("current_step_index", 0)
+    if index >= len(missing_fields):
+        return None
+    return missing_fields[index]
+
+
+def advance_onboarding_session(session: dict) -> str | None:
+    session["current_step_index"] = session.get("current_step_index", 0) + 1
+    return get_current_onboarding_field(session)
 
 
 def format_products_as_context(products: list[dict]) -> str:
@@ -289,6 +420,60 @@ async def send_product_responses(to: str, ai_response: dict):
         await send_text_message(to, ORDER_FOLLOW_UP_MESSAGE)
 
 
+async def send_ai_product_response(to: str, user_text: str):
+    ai_response = get_ai_response_json(user_text)
+    logger.info(f"AI Response: {ai_response}")
+    await send_product_responses(to, ai_response)
+
+
+async def complete_registration(session: dict) -> None:
+    client = get_supabase_client()
+    profile = session["profile"]
+
+    if session.get("user_id"):
+        update_user_profile(client, session["mobile"], profile)
+    else:
+        insert_user_profile(client, profile)
+
+    onboarding_sessions.pop(session["mobile"], None)
+
+
+async def process_onboarding_step(from_number: str, user_text: str, session: dict) -> dict:
+    current_field = get_current_onboarding_field(session)
+    cleaned_text = user_text.strip()
+
+    if current_field == "name":
+        if not is_valid_name(cleaned_text):
+            await send_text_message(from_number, "Please share your full name 😊")
+            return {"status": "awaiting_name"}
+        session["profile"]["name"] = re.sub(r"\s+", " ", cleaned_text)
+    elif current_field == "email":
+        if not is_valid_email(cleaned_text):
+            await send_text_message(from_number, "That email seems invalid. Please enter a valid email address 😊")
+            return {"status": "awaiting_email"}
+        session["profile"]["email"] = cleaned_text
+    elif current_field == "address":
+        if len(cleaned_text) < 8:
+            await send_text_message(from_number, "Please share your delivery address for future orders 🚚")
+            return {"status": "awaiting_address"}
+        session["profile"]["address"] = cleaned_text
+
+    next_field = advance_onboarding_session(session)
+    if next_field:
+        await send_text_message(from_number, get_onboarding_prompt(next_field))
+        return {"status": f"awaiting_{next_field}"}
+
+    await complete_registration(session)
+    await send_text_message(from_number, build_registration_completion_message())
+
+    pending_query = session.get("pending_query")
+    if pending_query:
+        await send_ai_product_response(from_number, pending_query)
+        return {"status": "registration_completed_and_query_processed"}
+
+    return {"status": "registration_completed"}
+
+
 # ============================================================
 # FASTAPI LIFESPAN
 # ============================================================
@@ -401,6 +586,36 @@ async def receive_message(request: Request):
 
         user_text = message["text"]["body"].strip()
         logger.info(f"Message: {user_text}")
+
+        client = get_supabase_client()
+        user = fetch_user_by_mobile(client, from_number)
+        pending_session = onboarding_sessions.get(from_number)
+
+        if pending_session:
+            return await process_onboarding_step(from_number, user_text, pending_session)
+
+        greeting_message = is_greeting_message(user_text)
+        pending_query = None if greeting_message else user_text
+
+        if user is None:
+            create_onboarding_session(None, from_number, pending_query)
+            await send_text_message(from_number, get_onboarding_prompt("name", is_new_user=True))
+            return {"status": "new_user_onboarding_started"}
+
+        missing_fields = get_missing_profile_fields(user)
+        if missing_fields:
+            session = create_onboarding_session(user, from_number, pending_query)
+            first_field = get_current_onboarding_field(session)
+            await send_text_message(from_number, get_onboarding_prompt(first_field))
+            return {"status": "existing_user_profile_completion_started"}
+
+        customer_name = str(user.get("name", "") or "").strip() or "there"
+        if greeting_message:
+            await send_text_message(from_number, f"Welcome back {customer_name} 😊\nHow can I help you today?")
+            return {"status": "welcome_back_sent"}
+
+        await send_ai_product_response(from_number, user_text)
+        return {"status": "message_processed"}
 
         # Handle greetings
         greetings = ["hi", "hello", "hey", "start", "helo", "vanakkam", "hai", "hii"]
