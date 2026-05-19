@@ -151,6 +151,12 @@ def normalize_address(address: str) -> str:
     cleaned = normalize_spaces(address)
     cleaned = re.sub(r"^(my address is|address is|address)\s*[:,-]?\s*", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"^(i live in|i am from|i'm from|from)\s+", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(
+        r"(?:,?\s*)?(?:mobile|mobile no|mobile number|phone|phone no|phone number|contact)\s*[:.-]?\s*\+?\d[\d\s-]{7,}$",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
     return cleaned.strip(" ,")
 
 
@@ -289,11 +295,28 @@ def get_missing_order_fields(profile: dict) -> list[str]:
     return missing_fields
 
 
+def extract_mobile_from_text(message: str) -> str:
+    match = re.search(
+        r"(?:mobile|mobile no|mobile number|phone|phone no|phone number|contact)\s*[:.-]?\s*(\+?\d[\d\s-]{7,})",
+        message,
+        re.IGNORECASE,
+    )
+    if not match:
+        return ""
+
+    digits_only = re.sub(r"\D", "", match.group(1))
+    if digits_only.startswith("91") and len(digits_only) > 10:
+        digits_only = digits_only[-10:]
+    return digits_only
+
+
 def extract_profile_details(message: str) -> dict:
-    extracted = {"name": "", "email": "", "address": ""}
+    extracted = {"name": "", "email": "", "address": "", "mobile": ""}
     text = message.strip()
     if not text:
         return extracted
+
+    extracted["mobile"] = extract_mobile_from_text(text)
 
     email_match = re.search(r"([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})", text, re.IGNORECASE)
     if email_match:
@@ -702,6 +725,7 @@ def build_order_state() -> dict:
         "quantity": None,
         "profile_updates": {},
         "awaiting": None,
+        "profile_saved": False,
     }
 
 
@@ -879,11 +903,34 @@ async def finalize_order(from_number: str, user: dict | None, order_state: dict)
         return {"status": "order_creation_failed"}
 
 
+def get_customer_mobile_for_display(from_number: str, extracted_mobile: str = "") -> str:
+    if extracted_mobile:
+        return extracted_mobile
+
+    digits_only = re.sub(r"\D", "", from_number or "")
+    if digits_only.startswith("91") and len(digits_only) > 10:
+        return digits_only[-10:]
+    return digits_only or from_number
+
+
+async def save_profile_before_confirmation(from_number: str, user: dict | None, order_state: dict) -> bool:
+    client = get_supabase_client()
+    merged_profile = merge_profile(user, order_state.get("profile_updates", {}), from_number)
+
+    try:
+        upsert_whatsapp_user(client, merged_profile)
+        order_state["profile_saved"] = True
+        return True
+    except Exception as exc:
+        logger.error("Profile pre-save failed for %s: %s", from_number, exc)
+        return False
+
+
 async def handle_order_flow(from_number: str, user: dict | None, user_text: str) -> dict:
     order_state = get_order_state(from_number)
 
     extracted_profile = extract_profile_details(user_text)
-    for field in ["name", "email", "address"]:
+    for field in ["name", "email", "address", "mobile"]:
         if extracted_profile.get(field):
             order_state["profile_updates"][field] = extracted_profile[field]
 
@@ -913,6 +960,7 @@ async def handle_order_flow(from_number: str, user: dict | None, user_text: str)
     missing_fields = get_missing_order_fields(merged_profile)
 
     if missing_fields:
+        order_state["profile_saved"] = False
         order_state["awaiting"] = missing_fields[0]
         if missing_fields[0] == "name":
             await send_text_message(from_number, "Please share your name 😊")
@@ -922,6 +970,16 @@ async def handle_order_flow(from_number: str, user: dict | None, user_text: str)
             await send_text_message(from_number, "Please share your details 😊")
         return {"status": f"awaiting_{missing_fields[0]}"}
 
+    if not order_state.get("profile_saved"):
+        saved = await save_profile_before_confirmation(from_number, user, order_state)
+        if not saved:
+            await send_text_message(from_number, PROFILE_SAVE_RETRY_MESSAGE)
+            return {"status": "profile_presave_failed"}
+
+    merged_profile["mobile"] = get_customer_mobile_for_display(
+        from_number,
+        order_state.get("profile_updates", {}).get("mobile", ""),
+    )
     order_state["awaiting"] = "confirm_details"
     await send_text_message(from_number, build_delivery_confirmation_message(merged_profile))
     return {"status": "awaiting_confirmation"}
