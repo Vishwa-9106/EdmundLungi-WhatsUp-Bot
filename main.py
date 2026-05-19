@@ -13,7 +13,8 @@ from supabase import Client, create_client
 
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_SECRET_KEY")
+SUPABASE_KEY = SUPABASE_SERVICE_ROLE_KEY or os.environ.get("SUPABASE_KEY")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
 WHATSAPP_PHONE_ID = os.environ.get("WHATSAPP_PHONE_ID")
@@ -472,6 +473,10 @@ def build_legacy_user_payload(profile: dict) -> dict:
     return payload
 
 
+def can_use_legacy_address_payload(table_name: str) -> bool:
+    return table_name == AUTH_USERS_TABLE
+
+
 def summarize_profile_for_logs(profile: dict) -> dict:
     return {
         "mobile": profile.get("mobile"),
@@ -541,6 +546,9 @@ def upsert_whatsapp_user(client: Client, profile: dict) -> dict | None:
                 target_table,
             )
             return fetched_after_failure
+
+        if not can_use_legacy_address_payload(target_table):
+            raise
 
     legacy_payload = build_legacy_user_payload(profile)
     try:
@@ -1939,6 +1947,12 @@ async def lifespan(app: FastAPI):
     global product_context, products_list, groq_client
 
     logger.info("Starting Edmund Lungis WhatsApp Assistant")
+    if SUPABASE_SERVICE_ROLE_KEY:
+        logger.info("Supabase client is using a service-role key for server-side writes")
+    else:
+        logger.warning(
+            "Supabase service-role key not found. New inserts may fail if row-level security blocks anon writes."
+        )
 
     if GROQ_API_KEY:
         groq_client = Groq(api_key=GROQ_API_KEY)
