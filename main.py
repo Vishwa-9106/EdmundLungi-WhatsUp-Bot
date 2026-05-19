@@ -583,7 +583,11 @@ def extract_search_terms(message: str) -> list[str]:
     normalized = re.sub(r"\b(more|next|continue|still)\b", " ", normalized)
     normalized = re.sub(r"\b(under|below|less|than|between|and|to|above|over)\s+\d+\b", " ", normalized)
     normalized = re.sub(r"\b\d+\b", " ", normalized)
-    terms = [term for term in normalized.split() if len(term) > 1]
+    stop_words = {
+        "the", "a", "an", "all", "any", "with", "without", "in", "on", "at",
+        "from", "of", "my", "your", "our", "this", "that", "these", "those",
+    }
+    terms = [term for term in normalized.split() if len(term) > 1 and term not in stop_words]
     return terms
 
 
