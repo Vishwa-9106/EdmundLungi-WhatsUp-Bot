@@ -472,29 +472,97 @@ def build_legacy_user_payload(profile: dict) -> dict:
     return payload
 
 
+def summarize_profile_for_logs(profile: dict) -> dict:
+    return {
+        "mobile": profile.get("mobile"),
+        "name": profile.get("name"),
+        "email": profile.get("email"),
+        "address": profile.get("address"),
+        "wishlist_count": len(profile.get("wishlist") or []),
+        "total_orders": profile.get("total_orders"),
+    }
+
+
+def summarize_payload_for_logs(payload: dict) -> dict:
+    summary = {
+        "mobile": payload.get("mobile"),
+        "name": payload.get("name"),
+        "email": payload.get("email"),
+        "has_addresses": isinstance(payload.get("addresses"), dict),
+        "addresses": payload.get("addresses"),
+        "wishlist_count": len(payload.get("wishlist") or []) if "wishlist" in payload else None,
+        "wishlist_preview": (payload.get("wishlist") or [])[:3] if "wishlist" in payload else None,
+        "total_orders": payload.get("total_orders"),
+    }
+    return summary
+
+
+def format_exception_details(exc: Exception) -> dict:
+    details = {
+        "type": type(exc).__name__,
+        "message": str(exc),
+        "args": list(exc.args),
+    }
+    try:
+        extra_attrs = {
+            key: value
+            for key, value in vars(exc).items()
+            if not key.startswith("_")
+        }
+        if extra_attrs:
+            details["attrs"] = extra_attrs
+    except Exception:
+        pass
+    return details
+
+
 def upsert_whatsapp_user(client: Client, profile: dict) -> dict | None:
     existing_user = fetch_whatsapp_user(client, profile["mobile"])
     payload = build_whatsapp_user_payload(profile, existing_user)
     target_table = (existing_user or {}).get("_source_table") or WHATSAPP_USERS_TABLE
 
     try:
-        if existing_user:
-            client.table(target_table).update(payload).eq("mobile", profile["mobile"]).execute()
-        else:
-            client.table(target_table).insert(payload).execute()
+        client.table(target_table).upsert(payload, on_conflict="mobile").execute()
         return fetch_whatsapp_user(client, profile["mobile"])
     except Exception as exc:
-        logger.error("Primary WhatsApp user upsert failed for %s: %s", profile["mobile"], exc)
+        logger.exception(
+            "Primary WhatsApp user upsert failed | mobile=%s | table=%s | profile=%s | payload=%s | exc=%s",
+            profile["mobile"],
+            target_table,
+            summarize_profile_for_logs(profile),
+            summarize_payload_for_logs(payload),
+            format_exception_details(exc),
+        )
+        fetched_after_failure = fetch_whatsapp_user(client, profile["mobile"])
+        if fetched_after_failure:
+            logger.warning(
+                "Primary WhatsApp user upsert failed but record exists after retry lookup | mobile=%s | table=%s",
+                profile["mobile"],
+                target_table,
+            )
+            return fetched_after_failure
 
     legacy_payload = build_legacy_user_payload(profile)
     try:
-        if existing_user:
-            client.table(target_table).update(legacy_payload).eq("mobile", profile["mobile"]).execute()
-        else:
-            client.table(target_table).insert(legacy_payload).execute()
+        client.table(target_table).upsert(legacy_payload, on_conflict="mobile").execute()
         return fetch_whatsapp_user(client, profile["mobile"])
     except Exception as exc:
-        logger.error("Legacy WhatsApp user upsert failed for %s: %s", profile["mobile"], exc)
+        logger.exception(
+            "Legacy WhatsApp user upsert failed | mobile=%s | table=%s | profile=%s | payload=%s | exc=%s",
+            profile["mobile"],
+            target_table,
+            summarize_profile_for_logs(profile),
+            summarize_payload_for_logs(legacy_payload),
+            format_exception_details(exc),
+        )
+        fetched_after_failure = fetch_whatsapp_user(client, profile["mobile"])
+        if fetched_after_failure:
+            logger.warning(
+                "Legacy WhatsApp user upsert failed but record exists after retry lookup | mobile=%s | table=%s",
+                profile["mobile"],
+                target_table,
+            )
+            return fetched_after_failure
         raise
 
 
@@ -548,6 +616,7 @@ def get_conversation_session(mobile: str) -> dict:
     return customer_sessions.setdefault(
         mobile,
         {
+            "processed_message_ids": [],
             "last_products": [],
             "browse": {
                 "search_query": "",
@@ -562,6 +631,25 @@ def get_conversation_session(mobile: str) -> dict:
             },
         },
     )
+
+
+def has_processed_message(mobile: str, message_id: str) -> bool:
+    if not message_id:
+        return False
+    processed_ids = get_conversation_session(mobile).setdefault("processed_message_ids", [])
+    return message_id in processed_ids
+
+
+def remember_processed_message(mobile: str, message_id: str, max_items: int = 50) -> None:
+    if not message_id:
+        return
+    session = get_conversation_session(mobile)
+    processed_ids = session.setdefault("processed_message_ids", [])
+    if message_id in processed_ids:
+        return
+    processed_ids.append(message_id)
+    if len(processed_ids) > max_items:
+        session["processed_message_ids"] = processed_ids[-max_items:]
 
 
 def remember_products(mobile: str, ai_products: list[dict]) -> None:
@@ -1244,7 +1332,14 @@ async def handle_customer_info_collection(from_number: str, user_text: str) -> d
     try:
         saved_user = upsert_whatsapp_user(client, merged_profile)
     except Exception as exc:
-        logger.error("Customer profile save failed for %s: %s", from_number, exc)
+        logger.exception(
+            "Customer profile save failed | mobile=%s | extracted_profile=%s | merged_profile=%s | pending_item=%s | exc=%s",
+            from_number,
+            extracted_profile,
+            summarize_profile_for_logs(merged_profile),
+            bool(pending_item),
+            format_exception_details(exc),
+        )
         await send_text_message(from_number, PROFILE_SAVE_RETRY_MESSAGE)
         return {"status": "customer_profile_save_failed"}
 
@@ -1926,6 +2021,7 @@ async def receive_message(request: Request):
 
         message = messages[0]
         from_number = message.get("from")
+        message_id = message.get("id", "")
         message_type = message.get("type")
 
         if message_type != "text":
@@ -1937,6 +2033,12 @@ async def receive_message(request: Request):
 
         user_text = message["text"]["body"].strip()
         logger.info("From %s: %s", from_number, user_text)
+
+        if has_processed_message(from_number, message_id):
+            logger.info("Duplicate WhatsApp message ignored for %s: %s", from_number, message_id)
+            return {"status": "duplicate_message_ignored"}
+
+        remember_processed_message(from_number, message_id)
 
         if is_greeting_message(user_text):
             await send_text_message(from_number, GREETING_MESSAGE)
