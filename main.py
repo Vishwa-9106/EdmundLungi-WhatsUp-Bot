@@ -46,17 +46,14 @@ Try asking:
 
 What are you looking for? 🛒"""
 
-ORDER_FOLLOW_UP_MESSAGE = """🛒 To place an order, please send:
-• Product name
-• Size needed
-• Quantity
+ORDER_FOLLOW_UP_MESSAGE = """🛒 You can:
+• Add products to cart
+• View cart
+• Remove products
+• Checkout anytime
 
 Example:
-Black Dhoti
-Size: Large
-Quantity: 2
-
-Our team will assist you further 😊"""
+Add Black Dhoti size Large quantity 2"""
 
 FRIENDLY_RETRY_MESSAGE = "Please try sending that once again 👍"
 FRIENDLY_REPHRASE_MESSAGE = "Could you please rephrase that 😊"
@@ -64,6 +61,17 @@ FRIENDLY_ERROR_MESSAGE = "Sorry, I couldn't process that properly 😊"
 PROFILE_SAVE_RETRY_MESSAGE = (
     "Sorry, I couldn't save your details right now 😊\nPlease try again in a moment."
 )
+CART_EMPTY_MESSAGE = "🛒 Your cart is empty right now.\n\nYou can continue shopping and add products anytime 😊"
+CUSTOMER_INFO_REQUEST_MESSAGE = """😊 Before adding items to your cart, please share:
+
+👤 Name:
+📧 Email:
+🏠 Address:
+
+Example:
+Name: Pradeep
+Email: pradeep@gmail.com
+Address: 12 Gandhi Street, Chennai"""
 
 ORDER_STATUS_MESSAGES = {
     "confirmed": "✅ Your Edmund Lungis order has been confirmed!",
@@ -196,6 +204,7 @@ def is_show_more_message(message: str) -> bool:
 def is_order_intent_message(message: str) -> bool:
     lowered = message.lower()
     keywords = [
+        "checkout",
         "place order",
         "order this",
         "buy now",
@@ -203,6 +212,7 @@ def is_order_intent_message(message: str) -> bool:
         "i need this",
         "confirm order",
         "purchase this",
+        "confirm cart",
     ]
     if any(keyword in lowered for keyword in keywords):
         return True
@@ -223,6 +233,42 @@ def is_wishlist_intent_message(message: str) -> bool:
     lowered = message.lower()
     keywords = ["save this", "add to wishlist", "wishlist this product", "wishlist this", "save to wishlist"]
     return any(keyword in lowered for keyword in keywords)
+
+
+def is_add_to_cart_intent_message(message: str, mobile: str = "") -> bool:
+    lowered = message.lower()
+    keywords = [
+        "add to cart",
+        "add this",
+        "save this",
+        "save this product",
+        "cart this",
+        "i want this",
+        "put this in cart",
+        "add it to cart",
+    ]
+    if any(keyword in lowered for keyword in keywords):
+        return True
+    if re.search(r"\badd\s+\d+\b", lowered):
+        return True
+    if re.search(r"\b(size|qty|quantity)\b", lowered) and resolve_product_from_message(message, mobile):
+        return True
+    return False
+
+
+def is_view_cart_message(message: str) -> bool:
+    normalized = normalize_lookup(message)
+    return normalized in {"view cart", "show cart", "my cart", "cart"}
+
+
+def is_remove_from_cart_message(message: str) -> bool:
+    lowered = message.lower()
+    return any(phrase in lowered for phrase in ["remove from cart", "remove item", "delete item", "remove "])
+
+
+def is_checkout_message(message: str) -> bool:
+    normalized = normalize_lookup(message)
+    return normalized in {"checkout", "place order", "confirm cart", "confirm order"} or is_order_intent_message(message)
 
 
 def fetch_active_products(client: Client) -> list[dict]:
@@ -306,6 +352,18 @@ def get_missing_order_fields(profile: dict) -> list[str]:
         missing_fields.append("name")
     if not profile.get("mobile"):
         missing_fields.append("mobile")
+    if not is_valid_address(profile.get("address", "")):
+        missing_fields.append("address")
+    return missing_fields
+
+
+def get_missing_customer_fields(profile: dict) -> list[str]:
+    missing_fields = []
+    if not is_valid_name(profile.get("name", "")):
+        missing_fields.append("name")
+    email = profile.get("email", "")
+    if not email or not is_valid_email(email):
+        missing_fields.append("email")
     if not is_valid_address(profile.get("address", "")):
         missing_fields.append("address")
     return missing_fields
@@ -498,6 +556,10 @@ def get_conversation_session(mobile: str) -> dict:
                 "remaining_product_ids": [],
             },
             "order": None,
+            "cart": {
+                "awaiting_customer_info": False,
+                "pending_item": None,
+            },
         },
     )
 
@@ -727,8 +789,8 @@ def resolve_product_from_message(message: str, mobile: str) -> dict | None:
     recent_products = session.get("last_products", [])
     lowered = message.lower()
 
-    if any(token in lowered for token in ["this", "that", "same one", "same product"]) and len(recent_products) == 1:
-        return recent_products[0]
+    if any(token in lowered for token in ["this", "that", "same one", "same product"]) and recent_products:
+        return recent_products[-1]
 
     recent_match = find_product_by_name(message, recent_products)
     if recent_match:
@@ -742,6 +804,8 @@ def extract_quantity(message: str) -> int | None:
         r"\bquantity\s*[:=-]?\s*(\d+)\b",
         r"\bqty\s*[:=-]?\s*(\d+)\b",
         r"\b(\d+)\s*(?:pieces|piece|pcs|pc)\b",
+        r"\badd\s+(\d+)\b",
+        r"^\s*(\d+)\s+[a-z]",
     ]
     for pattern in patterns:
         match = re.search(pattern, message, re.IGNORECASE)
@@ -788,6 +852,536 @@ def build_product_caption(product: dict) -> str:
             f"✅ Stock Status: {availability}",
         ]
     )
+
+
+def build_cart_state() -> dict:
+    return {
+        "awaiting_customer_info": False,
+        "pending_item": None,
+    }
+
+
+def get_cart_state(mobile: str) -> dict:
+    session = get_conversation_session(mobile)
+    cart_state = session.get("cart")
+    if not isinstance(cart_state, dict):
+        session["cart"] = build_cart_state()
+    else:
+        cart_state.setdefault("awaiting_customer_info", False)
+        cart_state.setdefault("pending_item", None)
+    return session["cart"]
+
+
+def clear_cart_state(mobile: str) -> None:
+    get_conversation_session(mobile)["cart"] = build_cart_state()
+
+
+def parse_cart_item_entry(entry: str) -> dict | None:
+    parts = [normalize_spaces(part) for part in str(entry or "").split("|")]
+    if not parts or not parts[0]:
+        return None
+
+    quantity = 1
+    size = ""
+
+    if len(parts) >= 2 and not parts[1].lower().startswith("qty"):
+        size = parts[1]
+    if len(parts) >= 2 and parts[1].lower().startswith("qty"):
+        quantity_match = re.search(r"(\d+)", parts[1])
+        if quantity_match:
+            quantity = int(quantity_match.group(1))
+    if len(parts) >= 3:
+        quantity_match = re.search(r"(\d+)", parts[2])
+        if quantity_match:
+            quantity = int(quantity_match.group(1))
+
+    if normalize_lookup(size) in {"not specified", "no size", "default"}:
+        size = ""
+
+    return {
+        "product_name": parts[0],
+        "size": size,
+        "quantity": quantity,
+    }
+
+
+def format_cart_item_entry(product_name: str, size: str, quantity: int) -> str:
+    display_size = normalize_spaces(size) or "Not specified"
+    return f"{normalize_spaces(product_name)} | {display_size} | Qty:{int(quantity)}"
+
+
+def parse_cart_items(wishlist: list[str] | None) -> list[dict]:
+    items: list[dict] = []
+    for entry in wishlist or []:
+        parsed = parse_cart_item_entry(entry)
+        if parsed:
+            items.append(parsed)
+    return items
+
+
+def serialize_cart_items(items: list[dict]) -> list[str]:
+    return [
+        format_cart_item_entry(item.get("product_name", ""), item.get("size", ""), int(item.get("quantity") or 1))
+        for item in items
+        if item.get("product_name")
+    ]
+
+
+def find_matching_cart_index(items: list[dict], product_name: str, size: str = "") -> int | None:
+    normalized_product = normalize_lookup(product_name)
+    normalized_size = normalize_lookup(size)
+    for index, item in enumerate(items):
+        if normalize_lookup(item.get("product_name", "")) != normalized_product:
+            continue
+        if normalized_size and normalize_lookup(item.get("size", "")) != normalized_size:
+            continue
+        if not normalized_size and normalize_lookup(item.get("size", "")) not in {"", "not specified"}:
+            continue
+        return index
+    return None
+
+
+def upsert_cart_item(items: list[dict], product_name: str, size: str, quantity: int) -> tuple[list[dict], dict]:
+    normalized_size = normalize_spaces(size)
+    item_index = find_matching_cart_index(items, product_name, normalized_size)
+    if item_index is None:
+        new_item = {
+            "product_name": normalize_spaces(product_name),
+            "size": normalized_size,
+            "quantity": int(quantity),
+        }
+        items.append(new_item)
+        return items, new_item
+
+    items[item_index]["quantity"] = int(items[item_index].get("quantity") or 0) + int(quantity)
+    return items, items[item_index]
+
+
+def build_cart_item_summary(item: dict) -> str:
+    return "\n".join(
+        [
+            "🛒 Cart Item:",
+            f"• {item.get('product_name', 'Product')}",
+            f"• Size: {item.get('size') or 'Not specified'}",
+            f"• Quantity: {item.get('quantity')}",
+        ]
+    )
+
+
+def build_cart_added_message(item: dict) -> str:
+    return "\n".join(
+        [
+            "✅ Product added to your cart!",
+            "",
+            build_cart_item_summary(item),
+            "",
+            "You can continue shopping or type:",
+            "• View cart",
+            "• Checkout",
+            "• Show more products",
+        ]
+    )
+
+
+def build_cart_view_message(items: list[dict]) -> str:
+    lines = ["🛒 Your Cart:", ""]
+    for index, item in enumerate(items, start=1):
+        lines.extend(
+            [
+                f"{index}. {item.get('product_name', 'Product')}",
+                f"   Size: {item.get('size') or 'Not specified'}",
+                f"   Qty: {item.get('quantity')}",
+                "",
+            ]
+        )
+    lines.extend(
+        [
+            "You can:",
+            "• Remove item",
+            "• Continue shopping",
+            "• Checkout",
+        ]
+    )
+    return "\n".join(lines).strip()
+
+
+def build_checkout_success_message(items: list[dict]) -> str:
+    lines = ["✅ Your order has been placed successfully!", "", "🧾 Order Summary:"]
+    for index, item in enumerate(items, start=1):
+        lines.extend(
+            [
+                f"{index}. {item.get('product_name', 'Product')}",
+                f"   Size: {item.get('size') or 'Not specified'}",
+                f"   Qty: {item.get('quantity')}",
+            ]
+        )
+    lines.extend(["", "Thank you for shopping with Edmund Lungis 😊"])
+    return "\n".join(lines)
+
+
+def suggest_alternative_products(product: dict | None = None, query: str = "") -> list[dict]:
+    candidates: list[dict] = []
+
+    if product:
+        for candidate in products_list:
+            if str(candidate.get("id")) == str(product.get("id")):
+                continue
+            if not is_in_stock(candidate):
+                continue
+            same_category = normalize_lookup(candidate.get("category", "")) == normalize_lookup(product.get("category", ""))
+            same_material = normalize_lookup(candidate.get("material", "")) == normalize_lookup(product.get("material", ""))
+            same_color = normalize_lookup(candidate.get("color", "")) == normalize_lookup(product.get("color", ""))
+            if same_category or same_material or same_color:
+                candidates.append(candidate)
+    elif query:
+        candidates = search_products_direct(query)
+
+    if not candidates:
+        candidates = [candidate for candidate in sort_products_for_browsing(products_list) if is_in_stock(candidate)]
+
+    return candidates[:3]
+
+
+def build_unavailable_message(product_name: str, alternatives: list[dict]) -> str:
+    lines = ["😔 Sorry, this product is currently unavailable."]
+    if product_name:
+        lines.append(f"Product: {product_name}")
+    if alternatives:
+        lines.extend(["", "You can try:", *[f"• {item.get('name', 'Product')}" for item in alternatives]])
+    return "\n".join(lines)
+
+
+def validate_cart_selection(selection: dict) -> dict:
+    product = selection.get("product")
+    if not product:
+        return {"ok": False, "reason": "product_missing", "message": "Please mention the product name you want to add 😊"}
+
+    if not is_in_stock(product):
+        return {
+            "ok": False,
+            "reason": "out_of_stock",
+            "message": build_unavailable_message(product.get("name", ""), suggest_alternative_products(product=product)),
+        }
+
+    sizes = get_product_sizes(product)
+    selected_size = normalize_spaces(selection.get("size", ""))
+    if sizes and len(sizes) == 1 and not selected_size:
+        selected_size = sizes[0]
+
+    if sizes and len(sizes) > 1:
+        if not selected_size:
+            return {
+                "ok": False,
+                "reason": "size_missing",
+                "message": (
+                    f"Please share the size for *{product.get('name', 'this product')}*.\n"
+                    f"Available sizes: {', '.join(sizes)}"
+                ),
+            }
+        matched_size = match_size(product, selected_size)
+        if not matched_size:
+            return {
+                "ok": False,
+                "reason": "size_unavailable",
+                "message": (
+                    f"😔 Sorry, that size is unavailable for *{product.get('name', 'this product')}*.\n"
+                    f"Available sizes: {', '.join(sizes)}"
+                ),
+            }
+        selected_size = matched_size
+    elif selected_size:
+        matched_size = match_size(product, selected_size)
+        if matched_size:
+            selected_size = matched_size
+
+    quantity = int(selection.get("quantity") or 1)
+    if quantity < 1:
+        return {"ok": False, "reason": "quantity_invalid", "message": "Please share a valid quantity 😊"}
+
+    available_stock = get_stock_quantity(product)
+    if quantity > available_stock:
+        return {
+            "ok": False,
+            "reason": "stock_shortage",
+            "message": (
+                f"😔 Sorry, only {available_stock} piece(s) are available for *{product.get('name', 'this product')}* right now."
+            ),
+        }
+
+    return {
+        "ok": True,
+        "product": product,
+        "size": selected_size,
+        "quantity": quantity,
+    }
+
+
+def extract_cart_selection(message: str, mobile: str) -> dict:
+    selection = {"product": None, "size": "", "quantity": None}
+    apply_order_details_from_message(selection, message, mobile)
+    if not selection.get("quantity"):
+        selection["quantity"] = 1
+    return selection
+
+
+def validate_existing_cart_item(item: dict) -> dict:
+    product = find_product_by_name(item.get("product_name", ""))
+    if not product or not is_in_stock(product):
+        return {
+            "ok": False,
+            "message": build_unavailable_message(item.get("product_name", ""), suggest_alternative_products(query=item.get("product_name", ""))),
+        }
+
+    size = item.get("size", "")
+    sizes = get_product_sizes(product)
+    if sizes:
+        if not size and len(sizes) > 1:
+            return {
+                "ok": False,
+                "message": (
+                    f"Please update the size for *{item.get('product_name', 'this item')}* before checkout.\n"
+                    f"Available sizes: {', '.join(sizes)}"
+                ),
+            }
+        if size and not match_size(product, size):
+            return {
+                "ok": False,
+                "message": (
+                    f"😔 Sorry, the size selected for *{item.get('product_name', 'this item')}* is unavailable.\n"
+                    f"Available sizes: {', '.join(sizes)}"
+                ),
+            }
+        if not size and len(sizes) == 1:
+            size = sizes[0]
+
+    quantity = int(item.get("quantity") or 1)
+    available_stock = get_stock_quantity(product)
+    if quantity > available_stock:
+        return {
+            "ok": False,
+            "message": (
+                f"😔 Sorry, only {available_stock} piece(s) are available for *{item.get('product_name', 'this item')}* right now."
+            ),
+        }
+
+    return {
+        "ok": True,
+        "product": product,
+        "size": size,
+        "quantity": quantity,
+        "product_name": product.get("name", item.get("product_name", "")),
+    }
+
+
+def get_remove_target_index(items: list[dict], message: str, mobile: str) -> int | None:
+    normalized = normalize_lookup(message)
+    if len(items) == 1 and normalized in {"remove", "remove item", "delete item", "remove from cart"}:
+        return 0
+
+    product = resolve_product_from_message(message, mobile)
+    selected_size = extract_size(message, product) if product else None
+    if product:
+        for index, item in enumerate(items):
+            if normalize_lookup(item.get("product_name", "")) != normalize_lookup(product.get("name", "")):
+                continue
+            if selected_size and normalize_lookup(item.get("size", "")) != normalize_lookup(selected_size):
+                continue
+            return index
+
+    candidate_query = re.sub(r"\b(remove|delete|item|from|cart)\b", " ", message, flags=re.IGNORECASE)
+    candidate_query = normalize_lookup(candidate_query)
+    if candidate_query:
+        for index, item in enumerate(items):
+            haystack = normalize_lookup(f"{item.get('product_name', '')} {item.get('size', '')}")
+            if candidate_query in haystack or haystack in candidate_query:
+                return index
+
+    return None
+
+
+async def add_item_to_cart(from_number: str, whatsapp_user: dict | None, validated_selection: dict) -> dict:
+    client = get_supabase_client()
+    current_user = whatsapp_user or fetch_whatsapp_user(client, from_number)
+    merged_profile = merge_profile(current_user, {}, from_number)
+    cart_items = parse_cart_items((current_user or {}).get("wishlist") or [])
+    cart_items, saved_item = upsert_cart_item(
+        cart_items,
+        validated_selection["product"].get("name", ""),
+        validated_selection.get("size", ""),
+        int(validated_selection.get("quantity") or 1),
+    )
+    merged_profile["wishlist"] = serialize_cart_items(cart_items)
+    if current_user and "total_orders" in current_user:
+        merged_profile["total_orders"] = current_user.get("total_orders", 0)
+
+    upsert_whatsapp_user(client, merged_profile)
+    get_conversation_session(from_number)["last_products"] = [validated_selection["product"]]
+    await send_text_message(from_number, build_cart_added_message(saved_item))
+    return {"status": "cart_item_added"}
+
+
+async def handle_customer_info_collection(from_number: str, user_text: str) -> dict:
+    cart_state = get_cart_state(from_number)
+    pending_item = cart_state.get("pending_item")
+    client = get_supabase_client()
+    existing_user = fetch_whatsapp_user(client, from_number)
+    extracted_profile = extract_profile_details(user_text)
+    merged_profile = merge_profile(existing_user, extracted_profile, from_number)
+    missing_fields = get_missing_customer_fields(merged_profile)
+
+    if missing_fields:
+        await send_text_message(
+            from_number,
+            "😊 Please share your name, email, and address in one message.\n\n" + CUSTOMER_INFO_REQUEST_MESSAGE,
+        )
+        return {"status": "awaiting_customer_info"}
+
+    if existing_user and "wishlist" in existing_user:
+        merged_profile["wishlist"] = existing_user.get("wishlist") or []
+    if existing_user and "total_orders" in existing_user:
+        merged_profile["total_orders"] = existing_user.get("total_orders", 0)
+
+    try:
+        saved_user = upsert_whatsapp_user(client, merged_profile)
+    except Exception as exc:
+        logger.error("Customer profile save failed for %s: %s", from_number, exc)
+        await send_text_message(from_number, PROFILE_SAVE_RETRY_MESSAGE)
+        return {"status": "customer_profile_save_failed"}
+
+    cart_state["awaiting_customer_info"] = False
+    if pending_item:
+        cart_state["pending_item"] = None
+        return await add_item_to_cart(from_number, saved_user, pending_item)
+
+    clear_cart_state(from_number)
+    await send_text_message(from_number, "✅ Your details have been saved successfully 😊")
+    return {"status": "customer_profile_saved"}
+
+
+async def handle_add_to_cart(from_number: str, user_text: str) -> dict:
+    selection = extract_cart_selection(user_text, from_number)
+    validation = validate_cart_selection(selection)
+    if not validation.get("ok"):
+        await send_text_message(from_number, validation["message"])
+        return {"status": validation.get("reason", "cart_validation_failed")}
+
+    client = get_supabase_client()
+    whatsapp_user = fetch_whatsapp_user(client, from_number)
+    if not whatsapp_user:
+        cart_state = get_cart_state(from_number)
+        cart_state["awaiting_customer_info"] = True
+        cart_state["pending_item"] = validation
+        await send_text_message(from_number, CUSTOMER_INFO_REQUEST_MESSAGE)
+        return {"status": "awaiting_customer_info"}
+
+    try:
+        return await add_item_to_cart(from_number, whatsapp_user, validation)
+    except Exception as exc:
+        logger.error("Cart update failed for %s: %s", from_number, exc)
+        await send_text_message(from_number, "Sorry 😊 I couldn't update your cart right now. Please try again.")
+        return {"status": "cart_update_failed"}
+
+
+async def handle_view_cart(from_number: str) -> dict:
+    client = get_supabase_client()
+    whatsapp_user = fetch_whatsapp_user(client, from_number)
+    cart_items = parse_cart_items((whatsapp_user or {}).get("wishlist") or [])
+
+    if not cart_items:
+        await send_text_message(from_number, CART_EMPTY_MESSAGE)
+        return {"status": "cart_empty"}
+
+    await send_text_message(from_number, build_cart_view_message(cart_items))
+    return {"status": "cart_view_sent"}
+
+
+async def handle_remove_from_cart(from_number: str, user_text: str) -> dict:
+    client = get_supabase_client()
+    whatsapp_user = fetch_whatsapp_user(client, from_number)
+    cart_items = parse_cart_items((whatsapp_user or {}).get("wishlist") or [])
+
+    if not cart_items:
+        await send_text_message(from_number, CART_EMPTY_MESSAGE)
+        return {"status": "cart_empty"}
+
+    item_index = get_remove_target_index(cart_items, user_text, from_number)
+    if item_index is None:
+        await send_text_message(from_number, "Please mention the product you want to remove from your cart 😊")
+        return {"status": "remove_target_missing"}
+
+    cart_items.pop(item_index)
+    merged_profile = merge_profile(whatsapp_user, {}, from_number)
+    merged_profile["wishlist"] = serialize_cart_items(cart_items)
+    if whatsapp_user and "total_orders" in whatsapp_user:
+        merged_profile["total_orders"] = whatsapp_user.get("total_orders", 0)
+
+    try:
+        upsert_whatsapp_user(client, merged_profile)
+        await send_text_message(from_number, "🗑️ Item removed from your cart successfully.")
+        return {"status": "cart_item_removed"}
+    except Exception as exc:
+        logger.error("Cart remove failed for %s: %s", from_number, exc)
+        await send_text_message(from_number, "Sorry 😊 I couldn't update your cart right now. Please try again.")
+        return {"status": "cart_remove_failed"}
+
+
+async def handle_checkout(from_number: str) -> dict:
+    client = get_supabase_client()
+    whatsapp_user = fetch_whatsapp_user(client, from_number)
+    cart_items = parse_cart_items((whatsapp_user or {}).get("wishlist") or [])
+
+    if not cart_items:
+        await send_text_message(from_number, CART_EMPTY_MESSAGE)
+        return {"status": "cart_empty"}
+
+    validated_items = []
+    for item in cart_items:
+        validation = validate_existing_cart_item(item)
+        if not validation.get("ok"):
+            await send_text_message(from_number, validation["message"])
+            return {"status": "checkout_validation_failed"}
+        validated_items.append(validation)
+
+    merged_profile = merge_profile(whatsapp_user, {}, from_number)
+    current_total_orders = int((whatsapp_user or {}).get("total_orders") or 0)
+    merged_profile["total_orders"] = current_total_orders + 1
+    merged_profile["wishlist"] = []
+
+    try:
+        upsert_whatsapp_user(client, merged_profile)
+        timestamp = utc_now_iso()
+        for item in validated_items:
+            order_payload = {
+                "user_mobile": from_number,
+                "customer_name": merged_profile.get("name"),
+                "product_name": item.get("product_name"),
+                "quantity": int(item.get("quantity") or 1),
+                "size": item.get("size") or None,
+                "address": merged_profile.get("address"),
+                "order_status": "pending",
+                "updated_at": timestamp,
+            }
+            client.table(WHATSAPP_ORDERS_TABLE).insert(order_payload).execute()
+
+        clear_cart_state(from_number)
+        await send_text_message(
+            from_number,
+            build_checkout_success_message(
+                [
+                    {
+                        "product_name": item.get("product_name"),
+                        "size": item.get("size"),
+                        "quantity": item.get("quantity"),
+                    }
+                    for item in validated_items
+                ]
+            ),
+        )
+        return {"status": "checkout_completed"}
+    except Exception as exc:
+        logger.error("Checkout failed for %s: %s", from_number, exc)
+        await send_text_message(from_number, "Sorry 😊 I couldn't update your cart right now. Please try again.")
+        return {"status": "checkout_failed"}
 
 
 def get_ai_response_json(user_message: str) -> dict:
@@ -1347,6 +1941,22 @@ async def receive_message(request: Request):
         if is_greeting_message(user_text):
             await send_text_message(from_number, GREETING_MESSAGE)
             return {"status": "greeting_sent"}
+
+        cart_state = get_cart_state(from_number)
+        if cart_state.get("awaiting_customer_info"):
+            return await handle_customer_info_collection(from_number, user_text)
+
+        if is_view_cart_message(user_text):
+            return await handle_view_cart(from_number)
+
+        if is_remove_from_cart_message(user_text):
+            return await handle_remove_from_cart(from_number, user_text)
+
+        if is_add_to_cart_intent_message(user_text, from_number) or is_wishlist_intent_message(user_text):
+            return await handle_add_to_cart(from_number, user_text)
+
+        if is_checkout_message(user_text):
+            return await handle_checkout(from_number)
 
         browse_handled = await handle_paginated_browse(from_number, user_text)
         if browse_handled:
