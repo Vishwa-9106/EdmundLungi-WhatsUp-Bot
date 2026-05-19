@@ -1090,23 +1090,9 @@ async def receive_message(request: Request):
         user_text = message["text"]["body"].strip()
         logger.info("From %s: %s", from_number, user_text)
 
-        client = get_supabase_client()
-        user = fetch_customer_profile(client, from_number)
-        order_state = get_conversation_session(from_number).get("order")
-
         if is_greeting_message(user_text):
-            if user:
-                customer_name = normalize_spaces(user.get("name", "")) or "there"
-                await send_text_message(from_number, f"Welcome back {customer_name} 😊\nHow can I help you today?")
-                return {"status": "existing_user_greeted"}
             await send_text_message(from_number, GREETING_MESSAGE)
-            return {"status": "new_user_greeted"}
-
-        if is_wishlist_intent_message(user_text):
-            return await save_wishlist_item(from_number, user, user_text)
-
-        if order_state or is_order_intent_message(user_text):
-            return await handle_order_flow(from_number, user, user_text)
+            return {"status": "greeting_sent"}
 
         await send_ai_product_response(from_number, user_text)
         return {"status": "product_response_sent"}
@@ -1115,34 +1101,6 @@ async def receive_message(request: Request):
         logger.error("Webhook error: %s", exc)
         if "from_number" in locals() and from_number:
             await send_text_message(from_number, FRIENDLY_ERROR_MESSAGE)
-        return {"status": "error"}
-
-
-@app.post("/admin/orders/{order_id}/status")
-async def update_order_status(order_id: str, request: Request):
-    try:
-        payload = await request.json()
-        new_status = str(payload.get("status", "") or "").strip()
-        if new_status not in ORDER_STATUS_MESSAGES:
-            return {"status": "invalid_status"}
-
-        client = get_supabase_client()
-        order_response = client.table(WHATSAPP_ORDERS_TABLE).select("*").eq("id", order_id).limit(1).execute()
-        if not order_response.data:
-            return {"status": "order_not_found"}
-
-        order = order_response.data[0]
-        client.table(WHATSAPP_ORDERS_TABLE).update(
-            {
-                "order_status": new_status,
-                "updated_at": utc_now_iso(),
-            }
-        ).eq("id", order_id).execute()
-
-        await send_order_status_notification(order, new_status)
-        return {"status": "notification_sent"}
-    except Exception as exc:
-        logger.error("Order status update failed for %s: %s", order_id, exc)
         return {"status": "error"}
 
 
