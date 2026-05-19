@@ -27,6 +27,7 @@ AUTH_USERS_TABLE = "users"
 
 GROQ_MODEL = "llama-3.3-70b-versatile"
 WHATSAPP_API_URL = f"https://graph.facebook.com/v19.0/{WHATSAPP_PHONE_ID}/messages"
+PRODUCTS_PAGE_SIZE = 5
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -175,6 +176,21 @@ def is_valid_address(address: str) -> bool:
 def is_greeting_message(message: str) -> bool:
     greetings = {"hi", "hello", "hey", "vanakkam", "hlo", "helo", "hai", "hii", "start"}
     return normalize_lookup(message) in greetings
+
+
+def is_show_more_message(message: str) -> bool:
+    normalized = normalize_lookup(message)
+    more_phrases = {
+        "show more",
+        "more",
+        "next",
+        "continue",
+        "still more",
+        "show next",
+    }
+    if normalized in more_phrases:
+        return True
+    return normalized.startswith("more ") or normalized.startswith("show more ")
 
 
 def is_order_intent_message(message: str) -> bool:
@@ -475,6 +491,12 @@ def get_conversation_session(mobile: str) -> dict:
         mobile,
         {
             "last_products": [],
+            "browse": {
+                "search_query": "",
+                "matched_product_ids": [],
+                "shown_product_ids": [],
+                "remaining_product_ids": [],
+            },
             "order": None,
         },
     )
@@ -521,6 +543,179 @@ def find_product_by_name(name: str, candidates: list[dict] | None = None) -> dic
         None,
     )
     return contains_match
+
+
+def build_searchable_text(product: dict) -> str:
+    parts = [
+        product.get("name", ""),
+        product.get("category", ""),
+        product.get("description", ""),
+        product.get("material", ""),
+        product.get("color", ""),
+        " ".join(get_product_sizes(product)),
+    ]
+    return normalize_lookup(" ".join(str(part or "") for part in parts))
+
+
+def extract_budget_filters(message: str) -> tuple[int | None, int | None]:
+    lowered = message.lower()
+
+    under_match = re.search(r"\b(?:under|below|less than)\s+(\d+)\b", lowered)
+    if under_match:
+        return int(under_match.group(1)), None
+
+    between_match = re.search(r"\bbetween\s+(\d+)\s+(?:and|to)\s+(\d+)\b", lowered)
+    if between_match:
+        first = int(between_match.group(1))
+        second = int(between_match.group(2))
+        return max(first, second), min(first, second)
+
+    above_match = re.search(r"\b(?:above|over|more than)\s+(\d+)\b", lowered)
+    if above_match:
+        return None, int(above_match.group(1))
+
+    return None, None
+
+
+def extract_search_terms(message: str) -> list[str]:
+    normalized = normalize_lookup(message)
+    normalized = re.sub(r"\b(show|find|need|want|looking|search|for|please|me|some|collection|collections)\b", " ", normalized)
+    normalized = re.sub(r"\b(more|next|continue|still)\b", " ", normalized)
+    normalized = re.sub(r"\b(under|below|less|than|between|and|to|above|over)\s+\d+\b", " ", normalized)
+    normalized = re.sub(r"\b\d+\b", " ", normalized)
+    terms = [term for term in normalized.split() if len(term) > 1]
+    return terms
+
+
+def is_simple_product_query(message: str) -> bool:
+    normalized = normalize_lookup(message)
+    if is_show_more_message(message):
+        return True
+
+    product_keywords = {
+        "lungi", "lungis", "dhoti", "veshti", "vesti",
+        "cotton", "silk", "wedding", "white", "black", "premium", "daily", "wear",
+    }
+    words = normalized.split()
+    if not words:
+        return False
+    if len(words) <= 6 and any(word in product_keywords for word in words):
+        return True
+    return any(word in product_keywords for word in words) and any(prefix in normalized for prefix in ["show", "find", "under", "below"])
+
+
+def product_matches_terms(product: dict, terms: list[str], max_price: int | None, min_price: int | None) -> bool:
+    if not is_in_stock(product):
+        return False
+
+    price = product.get("price")
+    try:
+        numeric_price = float(price)
+    except Exception:
+        numeric_price = None
+
+    if max_price is not None and numeric_price is not None and numeric_price > max_price:
+        return False
+    if min_price is not None and numeric_price is not None and numeric_price < min_price:
+        return False
+
+    searchable_text = build_searchable_text(product)
+    synonym_map = {
+        "veshti": {"veshti", "vesti", "dhoti"},
+        "vesti": {"veshti", "vesti", "dhoti"},
+        "dhoti": {"veshti", "vesti", "dhoti"},
+        "lungi": {"lungi", "lungis"},
+        "lungis": {"lungi", "lungis"},
+    }
+
+    for term in terms:
+        valid_terms = synonym_map.get(term, {term})
+        if not any(valid_term in searchable_text for valid_term in valid_terms):
+            return False
+
+    return True
+
+
+def sort_products_for_browsing(products: list[dict]) -> list[dict]:
+    return sorted(
+        products,
+        key=lambda product: (
+            0 if is_in_stock(product) else 1,
+            float(product.get("price") or 0),
+            str(product.get("name", "")),
+        ),
+    )
+
+
+def search_products_direct(query: str) -> list[dict]:
+    max_price, min_price = extract_budget_filters(query)
+    terms = extract_search_terms(query)
+
+    matched_products = [
+        product
+        for product in products_list
+        if product_matches_terms(product, terms, max_price, min_price)
+    ]
+
+    if matched_products:
+        return sort_products_for_browsing(matched_products)
+
+    return []
+
+
+def build_browse_intro(query: str, count: int) -> str:
+    if count <= 0:
+        return "Product not available ❌"
+    if count == 1:
+        return f"Here is a matching product for *{query.strip()}* 😊"
+    return f"Here are some options for *{query.strip()}* 😊"
+
+
+def build_no_more_message(query: str) -> str:
+    if query:
+        return (
+            "😔 We've shown all available products for this search.\n\n"
+            "Would you like to explore cotton veshti or premium dhoti collections instead? 😊"
+        )
+    return "😔 Sorry, no more products are available in this category right now."
+
+
+def reset_browse_session(mobile: str, query: str, matched_products: list[dict]) -> dict:
+    session = get_conversation_session(mobile)
+    session["browse"] = {
+        "search_query": query,
+        "matched_product_ids": [str(product.get("id")) for product in matched_products if product.get("id") is not None],
+        "shown_product_ids": [],
+        "remaining_product_ids": [str(product.get("id")) for product in matched_products if product.get("id") is not None],
+    }
+    return session["browse"]
+
+
+def get_browse_session(mobile: str) -> dict:
+    session = get_conversation_session(mobile)
+    return session.setdefault(
+        "browse",
+        {
+            "search_query": "",
+            "matched_product_ids": [],
+            "shown_product_ids": [],
+            "remaining_product_ids": [],
+        },
+    )
+
+
+def get_products_by_ids(product_ids: list[str]) -> list[dict]:
+    id_map = {str(product.get("id")): product for product in products_list if product.get("id") is not None}
+    return [id_map[product_id] for product_id in product_ids if product_id in id_map]
+
+
+def get_next_browse_batch(mobile: str) -> tuple[list[dict], dict]:
+    browse_session = get_browse_session(mobile)
+    remaining_ids = browse_session.get("remaining_product_ids", [])
+    next_ids = remaining_ids[:PRODUCTS_PAGE_SIZE]
+    browse_session["remaining_product_ids"] = remaining_ids[PRODUCTS_PAGE_SIZE:]
+    browse_session["shown_product_ids"] = browse_session.get("shown_product_ids", []) + next_ids
+    return get_products_by_ids(next_ids), browse_session
 
 
 def resolve_product_from_message(message: str, mobile: str) -> dict | None:
@@ -677,16 +872,37 @@ async def send_image_message(to: str, image_url: str, caption: str) -> None:
     )
 
 
+async def send_product_batch(
+    to: str,
+    products: list[dict],
+    intro_message: str = "",
+    footer_message: str = "",
+) -> None:
+    if intro_message:
+        await send_text_message(to, intro_message)
+
+    for product in products:
+        caption = build_product_caption(product)
+        image_url = str(product.get("image_url", "") or "").strip()
+        if image_url.startswith("http"):
+            await send_image_message(to, image_url, caption)
+        else:
+            await send_text_message(to, caption)
+
+    if footer_message:
+        await send_text_message(to, footer_message)
+
+    if products:
+        await send_text_message(to, ORDER_FOLLOW_UP_MESSAGE)
+
+
 async def send_product_responses(to: str, ai_response: dict) -> None:
     intro_message = ai_response.get("message", "")
     products = ai_response.get("products", [])
     footer = ai_response.get("footer", "")
 
     remember_products(to, products)
-
-    if intro_message:
-        await send_text_message(to, intro_message)
-
+    resolved_products: list[dict] = []
     for product_ref in products:
         product = None
         product_id = str(product_ref.get("id", "") or "").strip()
@@ -696,20 +912,54 @@ async def send_product_responses(to: str, ai_response: dict) -> None:
             product = resolve_product_from_message(product_ref.get("name", ""), to)
         if not product:
             product = product_ref
+        resolved_products.append(product)
 
-        caption = build_product_caption(product)
-        image_url = str(product.get("image_url", "") or "").strip()
+    await send_product_batch(to, resolved_products, intro_message, footer)
 
-        if image_url.startswith("http"):
-            await send_image_message(to, image_url, caption)
-        else:
-            await send_text_message(to, caption)
 
-    if footer:
-        await send_text_message(to, footer)
+async def handle_paginated_browse(to: str, user_text: str) -> bool:
+    try:
+        if is_show_more_message(user_text):
+            browse_session = get_browse_session(to)
+            if not browse_session.get("search_query"):
+                await send_text_message(to, "Please tell me what you'd like to explore, like white dhoti or cotton lungi 😊")
+                return True
 
-    if products:
-        await send_text_message(to, ORDER_FOLLOW_UP_MESSAGE)
+            next_products, browse_session = get_next_browse_batch(to)
+            if not next_products:
+                await send_text_message(to, build_no_more_message(browse_session.get("search_query", "")))
+                return True
+
+            remember_products(
+                to,
+                [{"id": product.get("id"), "name": product.get("name")} for product in next_products],
+            )
+            await send_product_batch(
+                to,
+                next_products,
+                f"Here are more options for *{browse_session.get('search_query', '').strip()}* 😊",
+            )
+            return True
+
+        if not is_simple_product_query(user_text):
+            return False
+
+        matched_products = search_products_direct(user_text)
+        if not matched_products:
+            return False
+
+        reset_browse_session(to, user_text, matched_products)
+        next_products, _ = get_next_browse_batch(to)
+        remember_products(
+            to,
+            [{"id": product.get("id"), "name": product.get("name")} for product in next_products],
+        )
+        await send_product_batch(to, next_products, build_browse_intro(user_text, len(matched_products)))
+        return True
+    except Exception as exc:
+        logger.error("Direct browse failed for %s: %s", to, exc)
+        await send_text_message(to, "Sorry 😊 I couldn't fetch products right now. Please try again.")
+        return True
 
 
 async def send_ai_product_response(to: str, user_text: str) -> None:
@@ -1093,6 +1343,10 @@ async def receive_message(request: Request):
         if is_greeting_message(user_text):
             await send_text_message(from_number, GREETING_MESSAGE)
             return {"status": "greeting_sent"}
+
+        browse_handled = await handle_paginated_browse(from_number, user_text)
+        if browse_handled:
+            return {"status": "browse_response_sent"}
 
         await send_ai_product_response(from_number, user_text)
         return {"status": "product_response_sent"}
