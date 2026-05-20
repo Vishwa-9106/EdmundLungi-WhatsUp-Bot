@@ -14,7 +14,8 @@ from supabase import Client, create_client
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_SECRET_KEY")
-SUPABASE_KEY = SUPABASE_SERVICE_ROLE_KEY or os.environ.get("SUPABASE_KEY")
+SUPABASE_PUBLIC_KEY = os.environ.get("SUPABASE_KEY")
+SUPABASE_KEY = SUPABASE_PUBLIC_KEY or SUPABASE_SERVICE_ROLE_KEY
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
 WHATSAPP_PHONE_ID = os.environ.get("WHATSAPP_PHONE_ID")
@@ -132,7 +133,20 @@ If nothing matches:
 
 
 def get_supabase_client() -> Client:
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise RuntimeError("Supabase client is not configured. Set SUPABASE_URL and SUPABASE_KEY.")
     return create_client(SUPABASE_URL, SUPABASE_KEY)
+
+
+def get_supabase_write_client() -> Client:
+    if not SUPABASE_URL:
+        raise RuntimeError("Supabase client is not configured. Set SUPABASE_URL.")
+    if not SUPABASE_SERVICE_ROLE_KEY:
+        raise RuntimeError(
+            "SUPABASE_SERVICE_ROLE_KEY is required for server-side writes. "
+            "The current request is using the public Supabase key, and row-level security is blocking inserts/updates."
+        )
+    return create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 
 def utc_now_iso() -> str:
@@ -521,17 +535,28 @@ def format_exception_details(exc: Exception) -> dict:
     return details
 
 
+def is_rls_write_error(exc: Exception) -> bool:
+    code = getattr(exc, "code", None)
+    message = str(exc).lower()
+    return code == "42501" or "row-level security policy" in message
+
+
 def upsert_whatsapp_user(client: Client, profile: dict) -> dict | None:
     existing_user = fetch_whatsapp_user(client, profile["mobile"])
     payload = build_whatsapp_user_payload(profile, existing_user)
     target_table = (existing_user or {}).get("_source_table") or WHATSAPP_USERS_TABLE
+    write_client = get_supabase_write_client()
 
     try:
-        client.table(target_table).upsert(payload, on_conflict="mobile").execute()
+        write_client.table(target_table).upsert(payload, on_conflict="mobile").execute()
         return fetch_whatsapp_user(client, profile["mobile"])
     except Exception as exc:
+        log_message = "Primary WhatsApp user upsert failed"
+        if is_rls_write_error(exc):
+            log_message += " due to Supabase RLS/public-key write mismatch"
         logger.exception(
-            "Primary WhatsApp user upsert failed | mobile=%s | table=%s | profile=%s | payload=%s | exc=%s",
+            "%s | mobile=%s | table=%s | profile=%s | payload=%s | exc=%s",
+            log_message,
             profile["mobile"],
             target_table,
             summarize_profile_for_logs(profile),
@@ -552,11 +577,15 @@ def upsert_whatsapp_user(client: Client, profile: dict) -> dict | None:
 
     legacy_payload = build_legacy_user_payload(profile)
     try:
-        client.table(target_table).upsert(legacy_payload, on_conflict="mobile").execute()
+        write_client.table(target_table).upsert(legacy_payload, on_conflict="mobile").execute()
         return fetch_whatsapp_user(client, profile["mobile"])
     except Exception as exc:
+        log_message = "Legacy WhatsApp user upsert failed"
+        if is_rls_write_error(exc):
+            log_message += " due to Supabase RLS/public-key write mismatch"
         logger.exception(
-            "Legacy WhatsApp user upsert failed | mobile=%s | table=%s | profile=%s | payload=%s | exc=%s",
+            "%s | mobile=%s | table=%s | profile=%s | payload=%s | exc=%s",
+            log_message,
             profile["mobile"],
             target_table,
             summarize_profile_for_logs(profile),
@@ -972,6 +1001,33 @@ def clear_cart_state(mobile: str) -> None:
     get_conversation_session(mobile)["cart"] = build_cart_state()
 
 
+def coerce_wishlist_quantity(value: object) -> int:
+    try:
+        quantity = int(value or 1)
+    except (TypeError, ValueError):
+        quantity = 1
+    return max(quantity, 1)
+
+
+def parse_wishlist_item_entry(entry: object) -> dict | None:
+    if isinstance(entry, dict):
+        product_name = normalize_spaces(entry.get("product_name") or entry.get("name") or "")
+        if not product_name:
+            return None
+
+        size = normalize_spaces(entry.get("size") or "")
+        if normalize_lookup(size) in {"not specified", "no size", "default"}:
+            size = ""
+
+        return {
+            "product_name": product_name,
+            "size": size,
+            "quantity": coerce_wishlist_quantity(entry.get("quantity")),
+        }
+
+    return parse_cart_item_entry(str(entry or ""))
+
+
 def parse_cart_item_entry(entry: str) -> dict | None:
     parts = [normalize_spaces(part) for part in str(entry or "").split("|")]
     if not parts or not parts[0]:
@@ -997,7 +1053,7 @@ def parse_cart_item_entry(entry: str) -> dict | None:
     return {
         "product_name": parts[0],
         "size": size,
-        "quantity": quantity,
+        "quantity": coerce_wishlist_quantity(quantity),
     }
 
 
@@ -1006,18 +1062,22 @@ def format_cart_item_entry(product_name: str, size: str, quantity: int) -> str:
     return f"{normalize_spaces(product_name)} | {display_size} | Qty:{int(quantity)}"
 
 
-def parse_cart_items(wishlist: list[str] | None) -> list[dict]:
+def parse_cart_items(wishlist: list[object] | None) -> list[dict]:
     items: list[dict] = []
     for entry in wishlist or []:
-        parsed = parse_cart_item_entry(entry)
+        parsed = parse_wishlist_item_entry(entry)
         if parsed:
             items.append(parsed)
     return items
 
 
-def serialize_cart_items(items: list[dict]) -> list[str]:
+def serialize_cart_items(items: list[dict]) -> list[dict]:
     return [
-        format_cart_item_entry(item.get("product_name", ""), item.get("size", ""), int(item.get("quantity") or 1))
+        {
+            "product_name": normalize_spaces(item.get("product_name", "")),
+            "size": normalize_spaces(item.get("size", "")),
+            "quantity": coerce_wishlist_quantity(item.get("quantity")),
+        }
         for item in items
         if item.get("product_name")
     ]
@@ -1452,6 +1512,7 @@ async def handle_checkout(from_number: str) -> dict:
 
     try:
         upsert_whatsapp_user(client, merged_profile)
+        write_client = get_supabase_write_client()
         timestamp = utc_now_iso()
         for item in validated_items:
             order_payload = {
@@ -1464,7 +1525,7 @@ async def handle_checkout(from_number: str) -> dict:
                 "order_status": "pending",
                 "updated_at": timestamp,
             }
-            client.table(WHATSAPP_ORDERS_TABLE).insert(order_payload).execute()
+            write_client.table(WHATSAPP_ORDERS_TABLE).insert(order_payload).execute()
 
         clear_cart_state(from_number)
         await send_text_message(
@@ -1800,14 +1861,20 @@ async def save_wishlist_item(from_number: str, user: dict | None, user_text: str
     client = get_supabase_client()
     whatsapp_user = fetch_whatsapp_user(client, from_number)
     merged_profile = merge_profile(user, {}, from_number)
-    wishlist = list((whatsapp_user or {}).get("wishlist") or [])
+    wishlist_items = parse_cart_items((whatsapp_user or {}).get("wishlist") or [])
     product_name = str(product.get("name", "") or "").strip()
 
-    already_saved = product_name in wishlist
+    already_saved = find_matching_cart_index(wishlist_items, product_name) is not None
     if not already_saved:
-        wishlist.append(product_name)
+        wishlist_items.append(
+            {
+                "product_name": product_name,
+                "size": "",
+                "quantity": 1,
+            }
+        )
 
-    merged_profile["wishlist"] = wishlist
+    merged_profile["wishlist"] = serialize_cart_items(wishlist_items)
     if whatsapp_user and "total_orders" in whatsapp_user:
         merged_profile["total_orders"] = whatsapp_user.get("total_orders", 0)
 
@@ -1829,6 +1896,7 @@ async def finalize_order(from_number: str, user: dict | None, order_state: dict)
         current_total_orders = int((whatsapp_user or {}).get("total_orders") or 0)
         merged_profile["total_orders"] = current_total_orders + 1
         saved_user = upsert_whatsapp_user(client, merged_profile)
+        write_client = get_supabase_write_client()
 
         order_payload = {
             "user_mobile": from_number,
@@ -1840,7 +1908,7 @@ async def finalize_order(from_number: str, user: dict | None, order_state: dict)
             "order_status": "pending",
             "updated_at": utc_now_iso(),
         }
-        client.table(WHATSAPP_ORDERS_TABLE).insert(order_payload).execute()
+        write_client.table(WHATSAPP_ORDERS_TABLE).insert(order_payload).execute()
 
         clear_order_state(from_number)
         if saved_user:
@@ -1951,7 +2019,7 @@ async def lifespan(app: FastAPI):
         logger.info("Supabase client is using a service-role key for server-side writes")
     else:
         logger.warning(
-            "Supabase service-role key not found. New inserts may fail if row-level security blocks anon writes."
+            "Supabase service-role key not found. Reads may still work with SUPABASE_KEY, but writes to whatsapp_users/orders can fail when RLS blocks public-key access."
         )
 
     if GROQ_API_KEY:
