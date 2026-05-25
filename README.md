@@ -10,6 +10,7 @@ FastAPI-based WhatsApp shopping assistant for Edmund Lungis. It connects WhatsAp
 - Cart flow with add, view, remove, and checkout actions
 - Customer profile capture for name, email, mobile, and address
 - Order persistence in Supabase
+- Automatic WhatsApp order status notifications with delivery logs
 - Product replies with image + caption when an image URL is available
 - Health and root endpoints for deployment checks
 
@@ -52,6 +53,13 @@ VERIFY_TOKEN=edmund_lungis_verify_2024
 PRODUCTS_TABLE=products
 CUSTOMER_PROFILE_TABLE=whatsapp_users
 WHATSAPP_ORDERS_TABLE=whatsapp_orders
+WHATSAPP_NOTIFICATION_LOGS_TABLE=whatsapp_notification_logs
+DEFAULT_COUNTRY_CODE=91
+ORDER_STATUS_POLL_INTERVAL_SECONDS=2
+ORDER_STATUS_POLL_BATCH_SIZE=50
+ORDER_STATUS_MAX_RETRIES=3
+ORDER_STATUS_RETRY_DELAY_SECONDS=30
+ORDER_STATUS_BACKFILL_ON_START=false
 ```
 
 ### Notes
@@ -69,6 +77,7 @@ This creates:
 
 - `whatsapp_users`
 - `whatsapp_orders`
+- `whatsapp_notification_logs`
 
 The app also expects a products table, `products` by default, with active rows filtered by `is_active = true`.
 
@@ -139,11 +148,13 @@ The bot can handle:
 4. Product search is handled either by direct matching logic or by Groq using a constrained catalog prompt.
 5. Responses are sent back through the WhatsApp Cloud API.
 6. User profiles and orders are stored in Supabase.
+7. A background watcher polls `whatsapp_orders.updated_at`, sends the right WhatsApp template when `order_status` changes, and records the result in `whatsapp_notification_logs`.
 
 ## Important Behavior
 
 - Only text messages are processed.
 - Duplicate WhatsApp message IDs are ignored in memory during runtime.
+- Duplicate order status notifications are blocked at the database level with a unique `(order_id, order_status)` log key.
 - Product replies are capped at 5 items.
 - Cart and order session state is stored in memory, so restarting the app clears active conversation state.
 

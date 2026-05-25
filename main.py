@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -13,9 +14,7 @@ from supabase import Client, create_client
 
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_SECRET_KEY")
-SUPABASE_PUBLIC_KEY = os.environ.get("SUPABASE_KEY")
-SUPABASE_KEY = SUPABASE_PUBLIC_KEY or SUPABASE_SERVICE_ROLE_KEY
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
 WHATSAPP_PHONE_ID = os.environ.get("WHATSAPP_PHONE_ID")
@@ -24,8 +23,15 @@ VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "edmund_lungis_verify_2024")
 PRODUCTS_TABLE = os.environ.get("PRODUCTS_TABLE", "products")
 WHATSAPP_USERS_TABLE = os.environ.get("CUSTOMER_PROFILE_TABLE", "whatsapp_users")
 WHATSAPP_ORDERS_TABLE = os.environ.get("WHATSAPP_ORDERS_TABLE", "whatsapp_orders")
+WHATSAPP_NOTIFICATION_LOGS_TABLE = os.environ.get("WHATSAPP_NOTIFICATION_LOGS_TABLE", "whatsapp_notification_logs")
 DEFAULT_WHATSAPP_USERS_TABLE = "whatsapp_users"
 AUTH_USERS_TABLE = "users"
+DEFAULT_COUNTRY_CODE = re.sub(r"\D", "", os.environ.get("DEFAULT_COUNTRY_CODE", "91")) or "91"
+ORDER_STATUS_POLL_INTERVAL_SECONDS = max(float(os.environ.get("ORDER_STATUS_POLL_INTERVAL_SECONDS", "2")), 1.0)
+ORDER_STATUS_POLL_BATCH_SIZE = max(int(os.environ.get("ORDER_STATUS_POLL_BATCH_SIZE", "50")), 1)
+ORDER_STATUS_BACKFILL_ON_START = os.environ.get("ORDER_STATUS_BACKFILL_ON_START", "false").lower() == "true"
+ORDER_STATUS_MAX_RETRIES = max(int(os.environ.get("ORDER_STATUS_MAX_RETRIES", "3")), 1)
+ORDER_STATUS_RETRY_DELAY_SECONDS = max(int(os.environ.get("ORDER_STATUS_RETRY_DELAY_SECONDS", "30")), 5)
 
 GROQ_MODEL = "llama-3.3-70b-versatile"
 WHATSAPP_API_URL = f"https://graph.facebook.com/v19.0/{WHATSAPP_PHONE_ID}/messages"
@@ -48,14 +54,17 @@ Try asking:
 
 What are you looking for? 🛒"""
 
-ORDER_FOLLOW_UP_MESSAGE = """🛒 You can:
-• Add products to cart
-• View cart
-• Remove products
-• Checkout anytime
+ORDER_FOLLOW_UP_MESSAGE = """🛒 To place an order, please send:
+• Product name
+• Size needed
+• Quantity
 
 Example:
-Add Black Dhoti size Large quantity 2"""
+Black Dhoti
+Size: Large
+Quantity: 2
+
+Our team will assist you further 😊"""
 
 FRIENDLY_RETRY_MESSAGE = "Please try sending that once again 👍"
 FRIENDLY_REPHRASE_MESSAGE = "Could you please rephrase that 😊"
@@ -63,17 +72,6 @@ FRIENDLY_ERROR_MESSAGE = "Sorry, I couldn't process that properly 😊"
 PROFILE_SAVE_RETRY_MESSAGE = (
     "Sorry, I couldn't save your details right now 😊\nPlease try again in a moment."
 )
-CART_EMPTY_MESSAGE = "🛒 Your cart is empty right now.\n\nYou can continue shopping and add products anytime 😊"
-CUSTOMER_INFO_REQUEST_MESSAGE = """😊 Before adding items to your cart, please share:
-
-👤 Name:
-📧 Email:
-🏠 Address:
-
-Example:
-Name: Pradeep
-Email: pradeep@gmail.com
-Address: 12 Gandhi Street, Chennai"""
 
 ORDER_STATUS_MESSAGES = {
     "confirmed": "✅ Your Edmund Lungis order has been confirmed!",
@@ -85,10 +83,97 @@ ORDER_STATUS_MESSAGES = {
 }
 
 
+ORDER_STATUS_ALIASES = {
+    "pending": "pending",
+    "confirmed": "confirmed",
+    "processing": "processing",
+    "packed": "processing",
+    "shipped": "shipped",
+    "out_for_delivery": "shipped",
+    "delivered": "delivered",
+    "completed": "completed",
+    "cancelled": "cancelled",
+    "canceled": "cancelled",
+}
+
+ORDER_STATUS_TEMPLATES = {
+    "pending": (
+        "\U0001f6d2 Your order has been placed successfully at *Edmund Lungis*!\n\n"
+        "\U0001f4e6 Order Details:\n"
+        "\u2022 Product: {product_name}\n"
+        "\u2022 Size: {size}\n"
+        "\u2022 Quantity: {quantity}\n\n"
+        "\u23f3 Status: Pending\n\n"
+        "Our team will review your order shortly \U0001f60a"
+    ),
+    "confirmed": (
+        "\u2705 Your order has been confirmed by *Edmund Lungis*!\n\n"
+        "\U0001f4e6 Confirmed Order:\n"
+        "\u2022 Product: {product_name}\n"
+        "\u2022 Size: {size}\n"
+        "\u2022 Quantity: {quantity}\n\n"
+        "\U0001f389 Your order is now being prepared.\n\n"
+        "Thank you for shopping with us \U0001f60a"
+    ),
+    "processing": (
+        "\U0001f9f5 Your order is now being processed at *Edmund Lungis*!\n\n"
+        "\U0001f4e6 Order Details:\n"
+        "\u2022 Product: {product_name}\n"
+        "\u2022 Size: {size}\n"
+        "\u2022 Quantity: {quantity}\n\n"
+        "\u2699\ufe0f Status: Processing\n\n"
+        "We are preparing your order carefully \U0001f60a"
+    ),
+    "shipped": (
+        "\U0001f69a Your order has been shipped successfully!\n\n"
+        "\U0001f4e6 Shipped Order:\n"
+        "\u2022 Product: {product_name}\n"
+        "\u2022 Size: {size}\n"
+        "\u2022 Quantity: {quantity}\n\n"
+        "\U0001f4cd Status: Shipped\n\n"
+        "Your package will reach you soon \U0001f60a"
+    ),
+    "delivered": (
+        "\U0001f389 Your order has been delivered successfully!\n\n"
+        "\U0001f4e6 Delivered Order:\n"
+        "\u2022 Product: {product_name}\n"
+        "\u2022 Size: {size}\n"
+        "\u2022 Quantity: {quantity}\n\n"
+        "\u2764\ufe0f Thank you for shopping with *Edmund Lungis*.\n\n"
+        "We hope you love your purchase \U0001f60a"
+    ),
+    "completed": (
+        "\u2705 Your order has been completed successfully!\n\n"
+        "\U0001f4e6 Order Summary:\n"
+        "\u2022 Product: {product_name}\n"
+        "\u2022 Size: {size}\n"
+        "\u2022 Quantity: {quantity}\n\n"
+        "\U0001f64f Thank you for choosing *Edmund Lungis*.\n\n"
+        "We look forward to serving you again \U0001f60a"
+    ),
+    "cancelled": (
+        "\u274c Your order has been cancelled.\n\n"
+        "\U0001f4e6 Cancelled Order:\n"
+        "\u2022 Product: {product_name}\n"
+        "\u2022 Size: {size}\n"
+        "\u2022 Quantity: {quantity}\n\n"
+        "If you need assistance, please contact our support team \U0001f60a"
+    ),
+}
+
+
 product_context = ""
 products_list: list[dict] = []
 groq_client: Groq | None = None
 customer_sessions: dict[str, dict] = {}
+notification_watcher_task: asyncio.Task | None = None
+notification_watcher_state = {
+    "running": False,
+    "last_checked_at": None,
+    "last_processed_at": None,
+    "last_error": "",
+    "processed_count": 0,
+}
 
 
 SYSTEM_PROMPT = """You are the official AI shopping assistant for "Edmund Lungis", a premium traditional Indian wear brand.
@@ -133,20 +218,7 @@ If nothing matches:
 
 
 def get_supabase_client() -> Client:
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        raise RuntimeError("Supabase client is not configured. Set SUPABASE_URL and SUPABASE_KEY.")
     return create_client(SUPABASE_URL, SUPABASE_KEY)
-
-
-def get_supabase_write_client() -> Client:
-    if not SUPABASE_URL:
-        raise RuntimeError("Supabase client is not configured. Set SUPABASE_URL.")
-    if not SUPABASE_SERVICE_ROLE_KEY:
-        raise RuntimeError(
-            "SUPABASE_SERVICE_ROLE_KEY is required for server-side writes. "
-            "The current request is using the public Supabase key, and row-level security is blocking inserts/updates."
-        )
-    return create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 
 def utc_now_iso() -> str:
@@ -219,7 +291,6 @@ def is_show_more_message(message: str) -> bool:
 def is_order_intent_message(message: str) -> bool:
     lowered = message.lower()
     keywords = [
-        "checkout",
         "place order",
         "order this",
         "buy now",
@@ -227,7 +298,6 @@ def is_order_intent_message(message: str) -> bool:
         "i need this",
         "confirm order",
         "purchase this",
-        "confirm cart",
     ]
     if any(keyword in lowered for keyword in keywords):
         return True
@@ -248,42 +318,6 @@ def is_wishlist_intent_message(message: str) -> bool:
     lowered = message.lower()
     keywords = ["save this", "add to wishlist", "wishlist this product", "wishlist this", "save to wishlist"]
     return any(keyword in lowered for keyword in keywords)
-
-
-def is_add_to_cart_intent_message(message: str, mobile: str = "") -> bool:
-    lowered = message.lower()
-    keywords = [
-        "add to cart",
-        "add this",
-        "save this",
-        "save this product",
-        "cart this",
-        "i want this",
-        "put this in cart",
-        "add it to cart",
-    ]
-    if any(keyword in lowered for keyword in keywords):
-        return True
-    if re.search(r"\badd\s+\d+\b", lowered):
-        return True
-    if re.search(r"\b(size|qty|quantity)\b", lowered) and resolve_product_from_message(message, mobile):
-        return True
-    return False
-
-
-def is_view_cart_message(message: str) -> bool:
-    normalized = normalize_lookup(message)
-    return normalized in {"view cart", "show cart", "my cart", "cart"}
-
-
-def is_remove_from_cart_message(message: str) -> bool:
-    lowered = message.lower()
-    return any(phrase in lowered for phrase in ["remove from cart", "remove item", "delete item", "remove "])
-
-
-def is_checkout_message(message: str) -> bool:
-    normalized = normalize_lookup(message)
-    return normalized in {"checkout", "place order", "confirm cart", "confirm order"} or is_order_intent_message(message)
 
 
 def fetch_active_products(client: Client) -> list[dict]:
@@ -367,18 +401,6 @@ def get_missing_order_fields(profile: dict) -> list[str]:
         missing_fields.append("name")
     if not profile.get("mobile"):
         missing_fields.append("mobile")
-    if not is_valid_address(profile.get("address", "")):
-        missing_fields.append("address")
-    return missing_fields
-
-
-def get_missing_customer_fields(profile: dict) -> list[str]:
-    missing_fields = []
-    if not is_valid_name(profile.get("name", "")):
-        missing_fields.append("name")
-    email = profile.get("email", "")
-    if not email or not is_valid_email(email):
-        missing_fields.append("email")
     if not is_valid_address(profile.get("address", "")):
         missing_fields.append("address")
     return missing_fields
@@ -487,119 +509,29 @@ def build_legacy_user_payload(profile: dict) -> dict:
     return payload
 
 
-def can_use_legacy_address_payload(table_name: str) -> bool:
-    return table_name == AUTH_USERS_TABLE
-
-
-def summarize_profile_for_logs(profile: dict) -> dict:
-    return {
-        "mobile": profile.get("mobile"),
-        "name": profile.get("name"),
-        "email": profile.get("email"),
-        "address": profile.get("address"),
-        "wishlist_count": len(profile.get("wishlist") or []),
-        "total_orders": profile.get("total_orders"),
-    }
-
-
-def summarize_payload_for_logs(payload: dict) -> dict:
-    summary = {
-        "mobile": payload.get("mobile"),
-        "name": payload.get("name"),
-        "email": payload.get("email"),
-        "has_addresses": isinstance(payload.get("addresses"), dict),
-        "addresses": payload.get("addresses"),
-        "wishlist_count": len(payload.get("wishlist") or []) if "wishlist" in payload else None,
-        "wishlist_preview": (payload.get("wishlist") or [])[:3] if "wishlist" in payload else None,
-        "total_orders": payload.get("total_orders"),
-    }
-    return summary
-
-
-def format_exception_details(exc: Exception) -> dict:
-    details = {
-        "type": type(exc).__name__,
-        "message": str(exc),
-        "args": list(exc.args),
-    }
-    try:
-        extra_attrs = {
-            key: value
-            for key, value in vars(exc).items()
-            if not key.startswith("_")
-        }
-        if extra_attrs:
-            details["attrs"] = extra_attrs
-    except Exception:
-        pass
-    return details
-
-
-def is_rls_write_error(exc: Exception) -> bool:
-    code = getattr(exc, "code", None)
-    message = str(exc).lower()
-    return code == "42501" or "row-level security policy" in message
-
-
 def upsert_whatsapp_user(client: Client, profile: dict) -> dict | None:
     existing_user = fetch_whatsapp_user(client, profile["mobile"])
     payload = build_whatsapp_user_payload(profile, existing_user)
     target_table = (existing_user or {}).get("_source_table") or WHATSAPP_USERS_TABLE
-    write_client = get_supabase_write_client()
 
     try:
-        write_client.table(target_table).upsert(payload, on_conflict="mobile").execute()
+        if existing_user:
+            client.table(target_table).update(payload).eq("mobile", profile["mobile"]).execute()
+        else:
+            client.table(target_table).insert(payload).execute()
         return fetch_whatsapp_user(client, profile["mobile"])
     except Exception as exc:
-        log_message = "Primary WhatsApp user upsert failed"
-        if is_rls_write_error(exc):
-            log_message += " due to Supabase RLS/public-key write mismatch"
-        logger.exception(
-            "%s | mobile=%s | table=%s | profile=%s | payload=%s | exc=%s",
-            log_message,
-            profile["mobile"],
-            target_table,
-            summarize_profile_for_logs(profile),
-            summarize_payload_for_logs(payload),
-            format_exception_details(exc),
-        )
-        fetched_after_failure = fetch_whatsapp_user(client, profile["mobile"])
-        if fetched_after_failure:
-            logger.warning(
-                "Primary WhatsApp user upsert failed but record exists after retry lookup | mobile=%s | table=%s",
-                profile["mobile"],
-                target_table,
-            )
-            return fetched_after_failure
-
-        if not can_use_legacy_address_payload(target_table):
-            raise
+        logger.error("Primary WhatsApp user upsert failed for %s: %s", profile["mobile"], exc)
 
     legacy_payload = build_legacy_user_payload(profile)
     try:
-        write_client.table(target_table).upsert(legacy_payload, on_conflict="mobile").execute()
+        if existing_user:
+            client.table(target_table).update(legacy_payload).eq("mobile", profile["mobile"]).execute()
+        else:
+            client.table(target_table).insert(legacy_payload).execute()
         return fetch_whatsapp_user(client, profile["mobile"])
     except Exception as exc:
-        log_message = "Legacy WhatsApp user upsert failed"
-        if is_rls_write_error(exc):
-            log_message += " due to Supabase RLS/public-key write mismatch"
-        logger.exception(
-            "%s | mobile=%s | table=%s | profile=%s | payload=%s | exc=%s",
-            log_message,
-            profile["mobile"],
-            target_table,
-            summarize_profile_for_logs(profile),
-            summarize_payload_for_logs(legacy_payload),
-            format_exception_details(exc),
-        )
-        fetched_after_failure = fetch_whatsapp_user(client, profile["mobile"])
-        if fetched_after_failure:
-            logger.warning(
-                "Legacy WhatsApp user upsert failed but record exists after retry lookup | mobile=%s | table=%s",
-                profile["mobile"],
-                target_table,
-            )
-            return fetched_after_failure
+        logger.error("Legacy WhatsApp user upsert failed for %s: %s", profile["mobile"], exc)
         raise
 
 
@@ -653,7 +585,6 @@ def get_conversation_session(mobile: str) -> dict:
     return customer_sessions.setdefault(
         mobile,
         {
-            "processed_message_ids": [],
             "last_products": [],
             "browse": {
                 "search_query": "",
@@ -662,31 +593,8 @@ def get_conversation_session(mobile: str) -> dict:
                 "remaining_product_ids": [],
             },
             "order": None,
-            "cart": {
-                "awaiting_customer_info": False,
-                "pending_item": None,
-            },
         },
     )
-
-
-def has_processed_message(mobile: str, message_id: str) -> bool:
-    if not message_id:
-        return False
-    processed_ids = get_conversation_session(mobile).setdefault("processed_message_ids", [])
-    return message_id in processed_ids
-
-
-def remember_processed_message(mobile: str, message_id: str, max_items: int = 50) -> None:
-    if not message_id:
-        return
-    session = get_conversation_session(mobile)
-    processed_ids = session.setdefault("processed_message_ids", [])
-    if message_id in processed_ids:
-        return
-    processed_ids.append(message_id)
-    if len(processed_ids) > max_items:
-        session["processed_message_ids"] = processed_ids[-max_items:]
 
 
 def remember_products(mobile: str, ai_products: list[dict]) -> None:
@@ -914,8 +822,8 @@ def resolve_product_from_message(message: str, mobile: str) -> dict | None:
     recent_products = session.get("last_products", [])
     lowered = message.lower()
 
-    if any(token in lowered for token in ["this", "that", "same one", "same product"]) and recent_products:
-        return recent_products[-1]
+    if any(token in lowered for token in ["this", "that", "same one", "same product"]) and len(recent_products) == 1:
+        return recent_products[0]
 
     recent_match = find_product_by_name(message, recent_products)
     if recent_match:
@@ -929,8 +837,6 @@ def extract_quantity(message: str) -> int | None:
         r"\bquantity\s*[:=-]?\s*(\d+)\b",
         r"\bqty\s*[:=-]?\s*(\d+)\b",
         r"\b(\d+)\s*(?:pieces|piece|pcs|pc)\b",
-        r"\badd\s+(\d+)\b",
-        r"^\s*(\d+)\s+[a-z]",
     ]
     for pattern in patterns:
         match = re.search(pattern, message, re.IGNORECASE)
@@ -977,575 +883,6 @@ def build_product_caption(product: dict) -> str:
             f"✅ Stock Status: {availability}",
         ]
     )
-
-
-def build_cart_state() -> dict:
-    return {
-        "awaiting_customer_info": False,
-        "pending_item": None,
-    }
-
-
-def get_cart_state(mobile: str) -> dict:
-    session = get_conversation_session(mobile)
-    cart_state = session.get("cart")
-    if not isinstance(cart_state, dict):
-        session["cart"] = build_cart_state()
-    else:
-        cart_state.setdefault("awaiting_customer_info", False)
-        cart_state.setdefault("pending_item", None)
-    return session["cart"]
-
-
-def clear_cart_state(mobile: str) -> None:
-    get_conversation_session(mobile)["cart"] = build_cart_state()
-
-
-def coerce_wishlist_quantity(value: object) -> int:
-    try:
-        quantity = int(value or 1)
-    except (TypeError, ValueError):
-        quantity = 1
-    return max(quantity, 1)
-
-
-def parse_wishlist_item_entry(entry: object) -> dict | None:
-    if isinstance(entry, dict):
-        product_name = normalize_spaces(entry.get("product_name") or entry.get("name") or "")
-        if not product_name:
-            return None
-
-        size = normalize_spaces(entry.get("size") or "")
-        if normalize_lookup(size) in {"not specified", "no size", "default"}:
-            size = ""
-
-        return {
-            "product_name": product_name,
-            "size": size,
-            "quantity": coerce_wishlist_quantity(entry.get("quantity")),
-        }
-
-    return parse_cart_item_entry(str(entry or ""))
-
-
-def parse_cart_item_entry(entry: str) -> dict | None:
-    parts = [normalize_spaces(part) for part in str(entry or "").split("|")]
-    if not parts or not parts[0]:
-        return None
-
-    quantity = 1
-    size = ""
-
-    if len(parts) >= 2 and not parts[1].lower().startswith("qty"):
-        size = parts[1]
-    if len(parts) >= 2 and parts[1].lower().startswith("qty"):
-        quantity_match = re.search(r"(\d+)", parts[1])
-        if quantity_match:
-            quantity = int(quantity_match.group(1))
-    if len(parts) >= 3:
-        quantity_match = re.search(r"(\d+)", parts[2])
-        if quantity_match:
-            quantity = int(quantity_match.group(1))
-
-    if normalize_lookup(size) in {"not specified", "no size", "default"}:
-        size = ""
-
-    return {
-        "product_name": parts[0],
-        "size": size,
-        "quantity": coerce_wishlist_quantity(quantity),
-    }
-
-
-def format_cart_item_entry(product_name: str, size: str, quantity: int) -> str:
-    display_size = normalize_spaces(size) or "Not specified"
-    return f"{normalize_spaces(product_name)} | {display_size} | Qty:{int(quantity)}"
-
-
-def parse_cart_items(wishlist: list[object] | None) -> list[dict]:
-    items: list[dict] = []
-    for entry in wishlist or []:
-        parsed = parse_wishlist_item_entry(entry)
-        if parsed:
-            items.append(parsed)
-    return items
-
-
-def serialize_cart_items(items: list[dict]) -> list[dict]:
-    return [
-        {
-            "product_name": normalize_spaces(item.get("product_name", "")),
-            "size": normalize_spaces(item.get("size", "")),
-            "quantity": coerce_wishlist_quantity(item.get("quantity")),
-        }
-        for item in items
-        if item.get("product_name")
-    ]
-
-
-def find_matching_cart_index(items: list[dict], product_name: str, size: str = "") -> int | None:
-    normalized_product = normalize_lookup(product_name)
-    normalized_size = normalize_lookup(size)
-    for index, item in enumerate(items):
-        if normalize_lookup(item.get("product_name", "")) != normalized_product:
-            continue
-        if normalized_size and normalize_lookup(item.get("size", "")) != normalized_size:
-            continue
-        if not normalized_size and normalize_lookup(item.get("size", "")) not in {"", "not specified"}:
-            continue
-        return index
-    return None
-
-
-def upsert_cart_item(items: list[dict], product_name: str, size: str, quantity: int) -> tuple[list[dict], dict]:
-    normalized_size = normalize_spaces(size)
-    item_index = find_matching_cart_index(items, product_name, normalized_size)
-    if item_index is None:
-        new_item = {
-            "product_name": normalize_spaces(product_name),
-            "size": normalized_size,
-            "quantity": int(quantity),
-        }
-        items.append(new_item)
-        return items, new_item
-
-    items[item_index]["quantity"] = int(items[item_index].get("quantity") or 0) + int(quantity)
-    return items, items[item_index]
-
-
-def build_cart_item_summary(item: dict) -> str:
-    return "\n".join(
-        [
-            "🛒 Cart Item:",
-            f"• {item.get('product_name', 'Product')}",
-            f"• Size: {item.get('size') or 'Not specified'}",
-            f"• Quantity: {item.get('quantity')}",
-        ]
-    )
-
-
-def build_cart_added_message(item: dict) -> str:
-    return "\n".join(
-        [
-            "✅ Product added to your cart!",
-            "",
-            build_cart_item_summary(item),
-            "",
-            "You can continue shopping or type:",
-            "• View cart",
-            "• Checkout",
-            "• Show more products",
-        ]
-    )
-
-
-def build_cart_view_message(items: list[dict]) -> str:
-    lines = ["🛒 Your Cart:", ""]
-    for index, item in enumerate(items, start=1):
-        lines.extend(
-            [
-                f"{index}. {item.get('product_name', 'Product')}",
-                f"   Size: {item.get('size') or 'Not specified'}",
-                f"   Qty: {item.get('quantity')}",
-                "",
-            ]
-        )
-    lines.extend(
-        [
-            "You can:",
-            "• Remove item",
-            "• Continue shopping",
-            "• Checkout",
-        ]
-    )
-    return "\n".join(lines).strip()
-
-
-def build_checkout_success_message(items: list[dict]) -> str:
-    lines = ["✅ Your order has been placed successfully!", "", "🧾 Order Summary:"]
-    for index, item in enumerate(items, start=1):
-        lines.extend(
-            [
-                f"{index}. {item.get('product_name', 'Product')}",
-                f"   Size: {item.get('size') or 'Not specified'}",
-                f"   Qty: {item.get('quantity')}",
-            ]
-        )
-    lines.extend(["", "Thank you for shopping with Edmund Lungis 😊"])
-    return "\n".join(lines)
-
-
-def suggest_alternative_products(product: dict | None = None, query: str = "") -> list[dict]:
-    candidates: list[dict] = []
-
-    if product:
-        for candidate in products_list:
-            if str(candidate.get("id")) == str(product.get("id")):
-                continue
-            if not is_in_stock(candidate):
-                continue
-            same_category = normalize_lookup(candidate.get("category", "")) == normalize_lookup(product.get("category", ""))
-            same_material = normalize_lookup(candidate.get("material", "")) == normalize_lookup(product.get("material", ""))
-            same_color = normalize_lookup(candidate.get("color", "")) == normalize_lookup(product.get("color", ""))
-            if same_category or same_material or same_color:
-                candidates.append(candidate)
-    elif query:
-        candidates = search_products_direct(query)
-
-    if not candidates:
-        candidates = [candidate for candidate in sort_products_for_browsing(products_list) if is_in_stock(candidate)]
-
-    return candidates[:3]
-
-
-def build_unavailable_message(product_name: str, alternatives: list[dict]) -> str:
-    lines = ["😔 Sorry, this product is currently unavailable."]
-    if product_name:
-        lines.append(f"Product: {product_name}")
-    if alternatives:
-        lines.extend(["", "You can try:", *[f"• {item.get('name', 'Product')}" for item in alternatives]])
-    return "\n".join(lines)
-
-
-def validate_cart_selection(selection: dict) -> dict:
-    product = selection.get("product")
-    if not product:
-        return {"ok": False, "reason": "product_missing", "message": "Please mention the product name you want to add 😊"}
-
-    if not is_in_stock(product):
-        return {
-            "ok": False,
-            "reason": "out_of_stock",
-            "message": build_unavailable_message(product.get("name", ""), suggest_alternative_products(product=product)),
-        }
-
-    sizes = get_product_sizes(product)
-    selected_size = normalize_spaces(selection.get("size", ""))
-    if sizes and len(sizes) == 1 and not selected_size:
-        selected_size = sizes[0]
-
-    if sizes and len(sizes) > 1:
-        if not selected_size:
-            return {
-                "ok": False,
-                "reason": "size_missing",
-                "message": (
-                    f"Please share the size for *{product.get('name', 'this product')}*.\n"
-                    f"Available sizes: {', '.join(sizes)}"
-                ),
-            }
-        matched_size = match_size(product, selected_size)
-        if not matched_size:
-            return {
-                "ok": False,
-                "reason": "size_unavailable",
-                "message": (
-                    f"😔 Sorry, that size is unavailable for *{product.get('name', 'this product')}*.\n"
-                    f"Available sizes: {', '.join(sizes)}"
-                ),
-            }
-        selected_size = matched_size
-    elif selected_size:
-        matched_size = match_size(product, selected_size)
-        if matched_size:
-            selected_size = matched_size
-
-    quantity = int(selection.get("quantity") or 1)
-    if quantity < 1:
-        return {"ok": False, "reason": "quantity_invalid", "message": "Please share a valid quantity 😊"}
-
-    available_stock = get_stock_quantity(product)
-    if quantity > available_stock:
-        return {
-            "ok": False,
-            "reason": "stock_shortage",
-            "message": (
-                f"😔 Sorry, only {available_stock} piece(s) are available for *{product.get('name', 'this product')}* right now."
-            ),
-        }
-
-    return {
-        "ok": True,
-        "product": product,
-        "size": selected_size,
-        "quantity": quantity,
-    }
-
-
-def extract_cart_selection(message: str, mobile: str) -> dict:
-    selection = {"product": None, "size": "", "quantity": None}
-    apply_order_details_from_message(selection, message, mobile)
-    if not selection.get("quantity"):
-        selection["quantity"] = 1
-    return selection
-
-
-def validate_existing_cart_item(item: dict) -> dict:
-    product = find_product_by_name(item.get("product_name", ""))
-    if not product or not is_in_stock(product):
-        return {
-            "ok": False,
-            "message": build_unavailable_message(item.get("product_name", ""), suggest_alternative_products(query=item.get("product_name", ""))),
-        }
-
-    size = item.get("size", "")
-    sizes = get_product_sizes(product)
-    if sizes:
-        if not size and len(sizes) > 1:
-            return {
-                "ok": False,
-                "message": (
-                    f"Please update the size for *{item.get('product_name', 'this item')}* before checkout.\n"
-                    f"Available sizes: {', '.join(sizes)}"
-                ),
-            }
-        if size and not match_size(product, size):
-            return {
-                "ok": False,
-                "message": (
-                    f"😔 Sorry, the size selected for *{item.get('product_name', 'this item')}* is unavailable.\n"
-                    f"Available sizes: {', '.join(sizes)}"
-                ),
-            }
-        if not size and len(sizes) == 1:
-            size = sizes[0]
-
-    quantity = int(item.get("quantity") or 1)
-    available_stock = get_stock_quantity(product)
-    if quantity > available_stock:
-        return {
-            "ok": False,
-            "message": (
-                f"😔 Sorry, only {available_stock} piece(s) are available for *{item.get('product_name', 'this item')}* right now."
-            ),
-        }
-
-    return {
-        "ok": True,
-        "product": product,
-        "size": size,
-        "quantity": quantity,
-        "product_name": product.get("name", item.get("product_name", "")),
-    }
-
-
-def get_remove_target_index(items: list[dict], message: str, mobile: str) -> int | None:
-    normalized = normalize_lookup(message)
-    if len(items) == 1 and normalized in {"remove", "remove item", "delete item", "remove from cart"}:
-        return 0
-
-    product = resolve_product_from_message(message, mobile)
-    selected_size = extract_size(message, product) if product else None
-    if product:
-        for index, item in enumerate(items):
-            if normalize_lookup(item.get("product_name", "")) != normalize_lookup(product.get("name", "")):
-                continue
-            if selected_size and normalize_lookup(item.get("size", "")) != normalize_lookup(selected_size):
-                continue
-            return index
-
-    candidate_query = re.sub(r"\b(remove|delete|item|from|cart)\b", " ", message, flags=re.IGNORECASE)
-    candidate_query = normalize_lookup(candidate_query)
-    if candidate_query:
-        for index, item in enumerate(items):
-            haystack = normalize_lookup(f"{item.get('product_name', '')} {item.get('size', '')}")
-            if candidate_query in haystack or haystack in candidate_query:
-                return index
-
-    return None
-
-
-async def add_item_to_cart(from_number: str, whatsapp_user: dict | None, validated_selection: dict) -> dict:
-    client = get_supabase_client()
-    current_user = whatsapp_user or fetch_whatsapp_user(client, from_number)
-    merged_profile = merge_profile(current_user, {}, from_number)
-    cart_items = parse_cart_items((current_user or {}).get("wishlist") or [])
-    cart_items, saved_item = upsert_cart_item(
-        cart_items,
-        validated_selection["product"].get("name", ""),
-        validated_selection.get("size", ""),
-        int(validated_selection.get("quantity") or 1),
-    )
-    merged_profile["wishlist"] = serialize_cart_items(cart_items)
-    if current_user and "total_orders" in current_user:
-        merged_profile["total_orders"] = current_user.get("total_orders", 0)
-
-    upsert_whatsapp_user(client, merged_profile)
-    get_conversation_session(from_number)["last_products"] = [validated_selection["product"]]
-    await send_text_message(from_number, build_cart_added_message(saved_item))
-    return {"status": "cart_item_added"}
-
-
-async def handle_customer_info_collection(from_number: str, user_text: str) -> dict:
-    cart_state = get_cart_state(from_number)
-    pending_item = cart_state.get("pending_item")
-    client = get_supabase_client()
-    existing_user = fetch_whatsapp_user(client, from_number)
-    extracted_profile = extract_profile_details(user_text)
-    merged_profile = merge_profile(existing_user, extracted_profile, from_number)
-    missing_fields = get_missing_customer_fields(merged_profile)
-
-    if missing_fields:
-        await send_text_message(
-            from_number,
-            "😊 Please share your name, email, and address in one message.\n\n" + CUSTOMER_INFO_REQUEST_MESSAGE,
-        )
-        return {"status": "awaiting_customer_info"}
-
-    if existing_user and "wishlist" in existing_user:
-        merged_profile["wishlist"] = existing_user.get("wishlist") or []
-    if existing_user and "total_orders" in existing_user:
-        merged_profile["total_orders"] = existing_user.get("total_orders", 0)
-
-    try:
-        saved_user = upsert_whatsapp_user(client, merged_profile)
-    except Exception as exc:
-        logger.exception(
-            "Customer profile save failed | mobile=%s | extracted_profile=%s | merged_profile=%s | pending_item=%s | exc=%s",
-            from_number,
-            extracted_profile,
-            summarize_profile_for_logs(merged_profile),
-            bool(pending_item),
-            format_exception_details(exc),
-        )
-        await send_text_message(from_number, PROFILE_SAVE_RETRY_MESSAGE)
-        return {"status": "customer_profile_save_failed"}
-
-    cart_state["awaiting_customer_info"] = False
-    if pending_item:
-        cart_state["pending_item"] = None
-        return await add_item_to_cart(from_number, saved_user, pending_item)
-
-    clear_cart_state(from_number)
-    await send_text_message(from_number, "✅ Your details have been saved successfully 😊")
-    return {"status": "customer_profile_saved"}
-
-
-async def handle_add_to_cart(from_number: str, user_text: str) -> dict:
-    selection = extract_cart_selection(user_text, from_number)
-    validation = validate_cart_selection(selection)
-    if not validation.get("ok"):
-        await send_text_message(from_number, validation["message"])
-        return {"status": validation.get("reason", "cart_validation_failed")}
-
-    client = get_supabase_client()
-    whatsapp_user = fetch_whatsapp_user(client, from_number)
-    if not whatsapp_user:
-        cart_state = get_cart_state(from_number)
-        cart_state["awaiting_customer_info"] = True
-        cart_state["pending_item"] = validation
-        await send_text_message(from_number, CUSTOMER_INFO_REQUEST_MESSAGE)
-        return {"status": "awaiting_customer_info"}
-
-    try:
-        return await add_item_to_cart(from_number, whatsapp_user, validation)
-    except Exception as exc:
-        logger.error("Cart update failed for %s: %s", from_number, exc)
-        await send_text_message(from_number, "Sorry 😊 I couldn't update your cart right now. Please try again.")
-        return {"status": "cart_update_failed"}
-
-
-async def handle_view_cart(from_number: str) -> dict:
-    client = get_supabase_client()
-    whatsapp_user = fetch_whatsapp_user(client, from_number)
-    cart_items = parse_cart_items((whatsapp_user or {}).get("wishlist") or [])
-
-    if not cart_items:
-        await send_text_message(from_number, CART_EMPTY_MESSAGE)
-        return {"status": "cart_empty"}
-
-    await send_text_message(from_number, build_cart_view_message(cart_items))
-    return {"status": "cart_view_sent"}
-
-
-async def handle_remove_from_cart(from_number: str, user_text: str) -> dict:
-    client = get_supabase_client()
-    whatsapp_user = fetch_whatsapp_user(client, from_number)
-    cart_items = parse_cart_items((whatsapp_user or {}).get("wishlist") or [])
-
-    if not cart_items:
-        await send_text_message(from_number, CART_EMPTY_MESSAGE)
-        return {"status": "cart_empty"}
-
-    item_index = get_remove_target_index(cart_items, user_text, from_number)
-    if item_index is None:
-        await send_text_message(from_number, "Please mention the product you want to remove from your cart 😊")
-        return {"status": "remove_target_missing"}
-
-    cart_items.pop(item_index)
-    merged_profile = merge_profile(whatsapp_user, {}, from_number)
-    merged_profile["wishlist"] = serialize_cart_items(cart_items)
-    if whatsapp_user and "total_orders" in whatsapp_user:
-        merged_profile["total_orders"] = whatsapp_user.get("total_orders", 0)
-
-    try:
-        upsert_whatsapp_user(client, merged_profile)
-        await send_text_message(from_number, "🗑️ Item removed from your cart successfully.")
-        return {"status": "cart_item_removed"}
-    except Exception as exc:
-        logger.error("Cart remove failed for %s: %s", from_number, exc)
-        await send_text_message(from_number, "Sorry 😊 I couldn't update your cart right now. Please try again.")
-        return {"status": "cart_remove_failed"}
-
-
-async def handle_checkout(from_number: str) -> dict:
-    client = get_supabase_client()
-    whatsapp_user = fetch_whatsapp_user(client, from_number)
-    cart_items = parse_cart_items((whatsapp_user or {}).get("wishlist") or [])
-
-    if not cart_items:
-        await send_text_message(from_number, CART_EMPTY_MESSAGE)
-        return {"status": "cart_empty"}
-
-    validated_items = []
-    for item in cart_items:
-        validation = validate_existing_cart_item(item)
-        if not validation.get("ok"):
-            await send_text_message(from_number, validation["message"])
-            return {"status": "checkout_validation_failed"}
-        validated_items.append(validation)
-
-    merged_profile = merge_profile(whatsapp_user, {}, from_number)
-    current_total_orders = int((whatsapp_user or {}).get("total_orders") or 0)
-    merged_profile["total_orders"] = current_total_orders + 1
-    merged_profile["wishlist"] = []
-
-    try:
-        upsert_whatsapp_user(client, merged_profile)
-        write_client = get_supabase_write_client()
-        timestamp = utc_now_iso()
-        for item in validated_items:
-            order_payload = {
-                "user_mobile": from_number,
-                "customer_name": merged_profile.get("name"),
-                "product_name": item.get("product_name"),
-                "quantity": int(item.get("quantity") or 1),
-                "size": item.get("size") or None,
-                "address": merged_profile.get("address"),
-                "order_status": "pending",
-                "updated_at": timestamp,
-            }
-            write_client.table(WHATSAPP_ORDERS_TABLE).insert(order_payload).execute()
-
-        clear_cart_state(from_number)
-        await send_text_message(
-            from_number,
-            build_checkout_success_message(
-                [
-                    {
-                        "product_name": item.get("product_name"),
-                        "size": item.get("size"),
-                        "quantity": item.get("quantity"),
-                    }
-                    for item in validated_items
-                ]
-            ),
-        )
-        return {"status": "checkout_completed"}
-    except Exception as exc:
-        logger.error("Checkout failed for %s: %s", from_number, exc)
-        await send_text_message(from_number, "Sorry 😊 I couldn't update your cart right now. Please try again.")
-        return {"status": "checkout_failed"}
 
 
 def get_ai_response_json(user_message: str) -> dict:
@@ -1596,7 +933,7 @@ def get_ai_response_json(user_message: str) -> dict:
     }
 
 
-async def send_whatsapp_payload(payload: dict) -> None:
+async def send_whatsapp_payload(payload: dict) -> dict:
     headers = {
         "Authorization": f"Bearer {WHATSAPP_TOKEN}",
         "Content-Type": "application/json",
@@ -1605,6 +942,8 @@ async def send_whatsapp_payload(payload: dict) -> None:
         response = await client.post(WHATSAPP_API_URL, headers=headers, json=payload)
         if response.status_code != 200:
             logger.error("WhatsApp send failed: %s - %s", response.status_code, response.text)
+            raise RuntimeError(f"WhatsApp send failed with status {response.status_code}: {response.text}")
+        return response.json()
 
 
 async def send_text_message(to: str, message: str) -> None:
@@ -1861,20 +1200,14 @@ async def save_wishlist_item(from_number: str, user: dict | None, user_text: str
     client = get_supabase_client()
     whatsapp_user = fetch_whatsapp_user(client, from_number)
     merged_profile = merge_profile(user, {}, from_number)
-    wishlist_items = parse_cart_items((whatsapp_user or {}).get("wishlist") or [])
+    wishlist = list((whatsapp_user or {}).get("wishlist") or [])
     product_name = str(product.get("name", "") or "").strip()
 
-    already_saved = find_matching_cart_index(wishlist_items, product_name) is not None
+    already_saved = product_name in wishlist
     if not already_saved:
-        wishlist_items.append(
-            {
-                "product_name": product_name,
-                "size": "",
-                "quantity": 1,
-            }
-        )
+        wishlist.append(product_name)
 
-    merged_profile["wishlist"] = serialize_cart_items(wishlist_items)
+    merged_profile["wishlist"] = wishlist
     if whatsapp_user and "total_orders" in whatsapp_user:
         merged_profile["total_orders"] = whatsapp_user.get("total_orders", 0)
 
@@ -1896,7 +1229,6 @@ async def finalize_order(from_number: str, user: dict | None, order_state: dict)
         current_total_orders = int((whatsapp_user or {}).get("total_orders") or 0)
         merged_profile["total_orders"] = current_total_orders + 1
         saved_user = upsert_whatsapp_user(client, merged_profile)
-        write_client = get_supabase_write_client()
 
         order_payload = {
             "user_mobile": from_number,
@@ -1908,7 +1240,7 @@ async def finalize_order(from_number: str, user: dict | None, order_state: dict)
             "order_status": "pending",
             "updated_at": utc_now_iso(),
         }
-        write_client.table(WHATSAPP_ORDERS_TABLE).insert(order_payload).execute()
+        client.table(WHATSAPP_ORDERS_TABLE).insert(order_payload).execute()
 
         clear_order_state(from_number)
         if saved_user:
@@ -1930,6 +1262,196 @@ def get_customer_mobile_for_display(from_number: str, extracted_mobile: str = ""
     if digits_only.startswith("91") and len(digits_only) > 10:
         return digits_only[-10:]
     return digits_only or from_number
+
+
+def normalize_status(status: str) -> str:
+    normalized = normalize_lookup(status).replace(" ", "_")
+    return ORDER_STATUS_ALIASES.get(normalized, normalized)
+
+
+def normalize_whatsapp_phone(phone_number: str) -> str:
+    digits_only = re.sub(r"\D", "", str(phone_number or ""))
+    if not digits_only:
+        return ""
+    if digits_only.startswith(DEFAULT_COUNTRY_CODE):
+        return digits_only
+    if len(digits_only) == 10:
+        return f"{DEFAULT_COUNTRY_CODE}{digits_only}"
+    if digits_only.startswith("0") and len(digits_only) == 11:
+        return f"{DEFAULT_COUNTRY_CODE}{digits_only[-10:]}"
+    return digits_only
+
+
+def get_order_customer_name(order: dict, customer_profile: dict | None = None) -> str:
+    return (
+        normalize_name(order.get("customer_name", ""))
+        or normalize_name((customer_profile or {}).get("name", ""))
+        or "Customer"
+    )
+
+
+def build_order_status_message(order: dict, status: str, customer_profile: dict | None = None) -> str:
+    normalized_status = normalize_status(status)
+    template = ORDER_STATUS_TEMPLATES.get(normalized_status)
+    if not template:
+        return ""
+
+    return template.format(
+        customer_name=get_order_customer_name(order, customer_profile),
+        product_name=normalize_spaces(order.get("product_name", "")) or "your item",
+        size=normalize_spaces(order.get("size", "")) or "Standard",
+        quantity=int(order.get("quantity") or 1),
+    )
+
+
+def get_latest_order_cursor(client: Client) -> tuple[str | None, str]:
+    response = (
+        client.table(WHATSAPP_ORDERS_TABLE)
+        .select("id,updated_at")
+        .order("updated_at", desc=True)
+        .order("id", desc=True)
+        .limit(1)
+        .execute()
+    )
+    if response.data:
+        latest_order = response.data[0]
+        return latest_order.get("updated_at"), str(latest_order.get("id") or "")
+    return None, ""
+
+
+def fetch_recent_order_updates(client: Client, since_timestamp: str) -> list[dict]:
+    response = (
+        client.table(WHATSAPP_ORDERS_TABLE)
+        .select("id,user_mobile,customer_name,product_name,size,quantity,order_status,updated_at")
+        .gte("updated_at", since_timestamp)
+        .order("updated_at")
+        .order("id")
+        .limit(ORDER_STATUS_POLL_BATCH_SIZE)
+        .execute()
+    )
+    return response.data or []
+
+
+def fetch_order_by_id(client: Client, order_id: str) -> dict | None:
+    response = (
+        client.table(WHATSAPP_ORDERS_TABLE)
+        .select("id,user_mobile,customer_name,product_name,size,quantity,order_status,updated_at")
+        .eq("id", order_id)
+        .limit(1)
+        .execute()
+    )
+    return (response.data or [None])[0]
+
+
+def should_retry_notification(log_entry: dict) -> bool:
+    if log_entry.get("notification_status") != "failed":
+        return False
+    attempt_count = int(log_entry.get("attempt_count") or 0)
+    if attempt_count >= ORDER_STATUS_MAX_RETRIES:
+        return False
+
+    last_attempt_at = str(log_entry.get("last_attempt_at") or "")
+    if not last_attempt_at:
+        return True
+
+    try:
+        last_attempt = datetime.fromisoformat(last_attempt_at.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    next_retry_at = last_attempt.timestamp() + ORDER_STATUS_RETRY_DELAY_SECONDS
+    return datetime.now(timezone.utc).timestamp() >= next_retry_at
+
+
+def fetch_retryable_notification_logs(client: Client) -> list[dict]:
+    response = (
+        client.table(WHATSAPP_NOTIFICATION_LOGS_TABLE)
+        .select("*")
+        .eq("notification_status", "failed")
+        .order("last_attempt_at")
+        .limit(ORDER_STATUS_POLL_BATCH_SIZE)
+        .execute()
+    )
+    return [row for row in (response.data or []) if should_retry_notification(row)]
+
+
+def fetch_notification_log(client: Client, order_id: str, normalized_status: str) -> dict | None:
+    response = (
+        client.table(WHATSAPP_NOTIFICATION_LOGS_TABLE)
+        .select("*")
+        .eq("order_id", order_id)
+        .eq("order_status", normalized_status)
+        .limit(1)
+        .execute()
+    )
+    return (response.data or [None])[0]
+
+
+def reserve_notification_log(
+    client: Client,
+    order: dict,
+    normalized_status: str,
+    normalized_mobile: str,
+) -> dict | None:
+    existing_log = fetch_notification_log(client, order.get("id"), normalized_status)
+    if existing_log:
+        existing_status = existing_log.get("notification_status")
+        attempt_count = int(existing_log.get("attempt_count") or 0)
+        if existing_status in {"sent", "processing"}:
+            return None
+        if existing_status == "failed" and attempt_count >= ORDER_STATUS_MAX_RETRIES:
+            logger.warning(
+                "Max retry count reached for order %s status %s",
+                order.get("id"),
+                normalized_status,
+            )
+            return None
+
+        payload = {
+            "notification_status": "processing",
+            "attempt_count": attempt_count + 1,
+            "error_message": None,
+            "last_attempt_at": utc_now_iso(),
+        }
+        client.table(WHATSAPP_NOTIFICATION_LOGS_TABLE).update(payload).eq("id", existing_log["id"]).execute()
+        existing_log.update(payload)
+        return existing_log
+
+    payload = {
+        "order_id": order.get("id"),
+        "order_status": normalized_status,
+        "customer_name": get_order_customer_name(order),
+        "user_mobile": order.get("user_mobile"),
+        "normalized_mobile": normalized_mobile,
+        "product_name": order.get("product_name"),
+        "size": order.get("size"),
+        "quantity": int(order.get("quantity") or 1),
+        "notification_status": "processing",
+        "attempt_count": 1,
+        "last_attempt_at": utc_now_iso(),
+    }
+    try:
+        response = client.table(WHATSAPP_NOTIFICATION_LOGS_TABLE).insert(payload).execute()
+        return (response.data or [None])[0]
+    except Exception as exc:
+        if "duplicate" in str(exc).lower() or "unique" in str(exc).lower():
+            return fetch_notification_log(client, order.get("id"), normalized_status)
+        raise
+
+
+def update_notification_log(
+    client: Client,
+    log_id: str,
+    notification_status: str,
+    error_message: str = "",
+) -> None:
+    payload = {
+        "notification_status": notification_status,
+        "error_message": error_message or None,
+        "last_attempt_at": utc_now_iso(),
+    }
+    if notification_status == "sent":
+        payload["sent_at"] = utc_now_iso()
+    client.table(WHATSAPP_NOTIFICATION_LOGS_TABLE).update(payload).eq("id", log_id).execute()
 
 
 async def save_profile_before_confirmation(from_number: str, user: dict | None, order_state: dict) -> bool:
@@ -2005,22 +1527,100 @@ async def handle_order_flow(from_number: str, user: dict | None, user_text: str)
 
 
 async def send_order_status_notification(order: dict, new_status: str) -> None:
-    message = ORDER_STATUS_MESSAGES.get(new_status)
-    if message:
-        await send_text_message(order["user_mobile"], message)
+    client = get_supabase_client()
+    normalized_status = normalize_status(new_status)
+    normalized_mobile = normalize_whatsapp_phone(order.get("user_mobile", ""))
+    if not normalized_mobile:
+        logger.warning("Skipping status notification for order %s due to missing mobile", order.get("id"))
+        return
+
+    customer_profile = fetch_customer_profile(client, order.get("user_mobile", ""))
+    message = build_order_status_message(order, normalized_status, customer_profile)
+    if not message:
+        logger.info("No status template configured for %s", normalized_status)
+        return
+
+    try:
+        log_entry = reserve_notification_log(client, order, normalized_status, normalized_mobile)
+    except Exception as exc:
+        logger.error("Notification log reservation failed for order %s: %s", order.get("id"), exc)
+        return
+
+    if not log_entry or not log_entry.get("id"):
+        logger.info("Duplicate or exhausted notification skipped for order %s status %s", order.get("id"), normalized_status)
+        return
+
+    try:
+        await send_text_message(normalized_mobile, message)
+        update_notification_log(client, log_entry["id"], "sent")
+        notification_watcher_state["processed_count"] += 1
+    except Exception as exc:
+        logger.error("Order status notification failed for order %s: %s", order.get("id"), exc)
+        try:
+            update_notification_log(client, log_entry["id"], "failed", str(exc))
+        except Exception as update_exc:
+            logger.error("Failed to update notification log for order %s: %s", order.get("id"), update_exc)
+
+
+async def poll_order_status_updates() -> None:
+    client = get_supabase_client()
+    cursor = utc_now_iso()
+    cursor_order_id = ""
+
+    if ORDER_STATUS_BACKFILL_ON_START:
+        cursor = "1970-01-01T00:00:00+00:00"
+    else:
+        latest_timestamp, latest_order_id = get_latest_order_cursor(client)
+        if latest_timestamp:
+            cursor = latest_timestamp
+            cursor_order_id = latest_order_id
+
+    notification_watcher_state["running"] = True
+    notification_watcher_state["last_error"] = ""
+
+    while True:
+        try:
+            notification_watcher_state["last_checked_at"] = utc_now_iso()
+            updates = fetch_recent_order_updates(client, cursor)
+            if updates:
+                for order in updates:
+                    order_updated_at = order.get("updated_at") or cursor
+                    order_id = str(order.get("id") or "")
+                    if order_updated_at < cursor:
+                        continue
+                    if order_updated_at == cursor and cursor_order_id and order_id <= cursor_order_id:
+                        continue
+
+                    normalized_status = normalize_status(order.get("order_status", ""))
+                    if normalized_status in ORDER_STATUS_TEMPLATES:
+                        await send_order_status_notification(order, normalized_status)
+                    cursor = order_updated_at
+                    cursor_order_id = order_id
+                    notification_watcher_state["last_processed_at"] = cursor
+            else:
+                notification_watcher_state["last_processed_at"] = cursor
+
+            retryable_logs = fetch_retryable_notification_logs(client)
+            for retry_log in retryable_logs:
+                order = fetch_order_by_id(client, retry_log.get("order_id"))
+                if not order:
+                    continue
+                await send_order_status_notification(order, retry_log.get("order_status", ""))
+            notification_watcher_state["last_error"] = ""
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            notification_watcher_state["last_error"] = str(exc)
+            logger.error("Order status watcher error: %s", exc)
+
+        await asyncio.sleep(ORDER_STATUS_POLL_INTERVAL_SECONDS)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global product_context, products_list, groq_client
+    global notification_watcher_task, product_context, products_list, groq_client
 
     logger.info("Starting Edmund Lungis WhatsApp Assistant")
-    if SUPABASE_SERVICE_ROLE_KEY:
-        logger.info("Supabase client is using a service-role key for server-side writes")
-    else:
-        logger.warning(
-            "Supabase service-role key not found. Reads may still work with SUPABASE_KEY, but writes to whatsapp_users/orders can fail when RLS blocks public-key access."
-        )
 
     if GROQ_API_KEY:
         groq_client = Groq(api_key=GROQ_API_KEY)
@@ -2034,7 +1634,17 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.error("Startup error: %s", exc)
 
+    notification_watcher_task = asyncio.create_task(poll_order_status_updates())
+    logger.info("Order status watcher started")
+
     yield
+    if notification_watcher_task:
+        notification_watcher_task.cancel()
+        try:
+            await notification_watcher_task
+        except asyncio.CancelledError:
+            logger.info("Order status watcher stopped")
+    notification_watcher_state["running"] = False
     logger.info("Shutting down")
 
 
@@ -2053,6 +1663,7 @@ async def root():
         "service": "Edmund Lungis WhatsApp AI Assistant",
         "version": "5.0.0",
         "products": len(products_list),
+        "order_status_watcher": notification_watcher_state,
     }
 
 
@@ -2062,6 +1673,8 @@ async def health():
         "status": "healthy",
         "products_loaded": bool(products_list),
         "groq_ready": groq_client is not None,
+        "order_status_watcher_running": notification_watcher_state["running"],
+        "order_status_watcher_error": notification_watcher_state["last_error"],
     }
 
 
@@ -2103,7 +1716,6 @@ async def receive_message(request: Request):
 
         message = messages[0]
         from_number = message.get("from")
-        message_id = message.get("id", "")
         message_type = message.get("type")
 
         if message_type != "text":
@@ -2116,31 +1728,9 @@ async def receive_message(request: Request):
         user_text = message["text"]["body"].strip()
         logger.info("From %s: %s", from_number, user_text)
 
-        if has_processed_message(from_number, message_id):
-            logger.info("Duplicate WhatsApp message ignored for %s: %s", from_number, message_id)
-            return {"status": "duplicate_message_ignored"}
-
-        remember_processed_message(from_number, message_id)
-
         if is_greeting_message(user_text):
             await send_text_message(from_number, GREETING_MESSAGE)
             return {"status": "greeting_sent"}
-
-        cart_state = get_cart_state(from_number)
-        if cart_state.get("awaiting_customer_info"):
-            return await handle_customer_info_collection(from_number, user_text)
-
-        if is_view_cart_message(user_text):
-            return await handle_view_cart(from_number)
-
-        if is_remove_from_cart_message(user_text):
-            return await handle_remove_from_cart(from_number, user_text)
-
-        if is_add_to_cart_intent_message(user_text, from_number) or is_wishlist_intent_message(user_text):
-            return await handle_add_to_cart(from_number, user_text)
-
-        if is_checkout_message(user_text):
-            return await handle_checkout(from_number)
 
         browse_handled = await handle_paginated_browse(from_number, user_text)
         if browse_handled:
