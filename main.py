@@ -32,6 +32,17 @@ ORDER_STATUS_POLL_BATCH_SIZE = max(int(os.environ.get("ORDER_STATUS_POLL_BATCH_S
 ORDER_STATUS_BACKFILL_ON_START = os.environ.get("ORDER_STATUS_BACKFILL_ON_START", "false").lower() == "true"
 ORDER_STATUS_MAX_RETRIES = max(int(os.environ.get("ORDER_STATUS_MAX_RETRIES", "3")), 1)
 ORDER_STATUS_RETRY_DELAY_SECONDS = max(int(os.environ.get("ORDER_STATUS_RETRY_DELAY_SECONDS", "30")), 5)
+WHATSAPP_TEMPLATE_LANGUAGE_CODE = os.environ.get("WHATSAPP_TEMPLATE_LANGUAGE_CODE", "en")
+CUSTOMER_SERVICE_WINDOW_HOURS = float(os.environ.get("CUSTOMER_SERVICE_WINDOW_HOURS", "24"))
+WHATSAPP_STATUS_TEMPLATE_NAMES = {
+    "pending": os.environ.get("WHATSAPP_TEMPLATE_PENDING", "order_pending"),
+    "confirmed": os.environ.get("WHATSAPP_TEMPLATE_CONFIRMED", "order_confirmed"),
+    "processing": os.environ.get("WHATSAPP_TEMPLATE_PROCESSING", "order_processing"),
+    "shipped": os.environ.get("WHATSAPP_TEMPLATE_SHIPPED", "order_shipped"),
+    "delivered": os.environ.get("WHATSAPP_TEMPLATE_DELIVERED", "order_delivered"),
+    "completed": os.environ.get("WHATSAPP_TEMPLATE_COMPLETED", "order_completed"),
+    "cancelled": os.environ.get("WHATSAPP_TEMPLATE_CANCELLED", "order_cancelled"),
+}
 
 GROQ_MODEL = "llama-3.3-70b-versatile"
 WHATSAPP_API_URL = f"https://graph.facebook.com/v19.0/{WHATSAPP_PHONE_ID}/messages"
@@ -39,6 +50,23 @@ PRODUCTS_PAGE_SIZE = 5
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+class WhatsAppSendError(Exception):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int = 0,
+        error_code: int | None = None,
+        error_title: str = "",
+        error_details: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.error_code = error_code
+        self.error_title = error_title
+        self.error_details = error_details
 
 
 GREETING_MESSAGE = """👋 Welcome to *Edmund Lungis*!
@@ -225,6 +253,24 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def parse_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def parse_meta_timestamp(value: str | int | None) -> datetime | None:
+    if value in (None, ""):
+        return None
+    try:
+        return datetime.fromtimestamp(int(str(value)), tz=timezone.utc)
+    except (TypeError, ValueError, OSError):
+        return parse_datetime(str(value))
+
+
 def normalize_spaces(value: str) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
 
@@ -326,12 +372,19 @@ def fetch_active_products(client: Client) -> list[dict]:
 
 
 def fetch_profile_from_table(client: Client, table_name: str, mobile: str) -> dict | None:
-    response = client.table(table_name).select("*").eq("mobile", mobile).limit(1).execute()
-    if not response.data:
-        return None
-    record = response.data[0]
-    record["_source_table"] = table_name
-    return record
+    candidates = []
+    for candidate in [mobile, normalize_whatsapp_phone(mobile)]:
+        cleaned = normalize_spaces(candidate)
+        if cleaned and cleaned not in candidates:
+            candidates.append(cleaned)
+
+    for candidate in candidates:
+        response = client.table(table_name).select("*").eq("mobile", candidate).limit(1).execute()
+        if response.data:
+            record = response.data[0]
+            record["_source_table"] = table_name
+            return record
+    return None
 
 
 def get_profile_lookup_tables() -> list[str]:
@@ -495,6 +548,9 @@ def build_whatsapp_user_payload(profile: dict, existing_user: dict | None = None
     if "total_orders" in profile:
         payload["total_orders"] = profile["total_orders"]
 
+    if "last_customer_message_at" in profile:
+        payload["last_customer_message_at"] = profile["last_customer_message_at"]
+
     return payload
 
 
@@ -506,6 +562,8 @@ def build_legacy_user_payload(profile: dict) -> dict:
     }
     if profile.get("address"):
         payload["address"] = profile["address"]
+    if "last_customer_message_at" in profile:
+        payload["last_customer_message_at"] = profile["last_customer_message_at"]
     return payload
 
 
@@ -941,19 +999,64 @@ async def send_whatsapp_payload(payload: dict) -> dict:
     async with httpx.AsyncClient() as client:
         response = await client.post(WHATSAPP_API_URL, headers=headers, json=payload)
         if response.status_code != 200:
+            error_code = None
+            error_title = ""
+            error_details = ""
+            try:
+                error_payload = response.json().get("error", {})
+                error_code = error_payload.get("code")
+                error_title = str(error_payload.get("error_user_title") or error_payload.get("message") or "")
+                error_details = str(error_payload.get("error_user_msg") or error_payload.get("error_data", {}).get("details") or "")
+            except Exception:
+                pass
             logger.error("WhatsApp send failed: %s - %s", response.status_code, response.text)
-            raise RuntimeError(f"WhatsApp send failed with status {response.status_code}: {response.text}")
+            raise WhatsAppSendError(
+                f"WhatsApp send failed with status {response.status_code}: {response.text}",
+                status_code=response.status_code,
+                error_code=error_code,
+                error_title=error_title,
+                error_details=error_details,
+            )
         return response.json()
 
 
-async def send_text_message(to: str, message: str) -> None:
-    await send_whatsapp_payload(
+async def send_text_message(to: str, message: str) -> dict:
+    return await send_whatsapp_payload(
         {
             "messaging_product": "whatsapp",
             "recipient_type": "individual",
             "to": to,
             "type": "text",
             "text": {"body": message},
+        }
+    )
+
+
+async def send_template_message(
+    to: str,
+    template_name: str,
+    body_parameters: list[str],
+) -> dict:
+    components = []
+    if body_parameters:
+        components.append(
+            {
+                "type": "body",
+                "parameters": [{"type": "text", "text": str(parameter)} for parameter in body_parameters],
+            }
+        )
+
+    return await send_whatsapp_payload(
+        {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": to,
+            "type": "template",
+            "template": {
+                "name": template_name,
+                "language": {"code": WHATSAPP_TEMPLATE_LANGUAGE_CODE},
+                "components": components,
+            },
         }
     )
 
@@ -1282,12 +1385,45 @@ def normalize_whatsapp_phone(phone_number: str) -> str:
     return digits_only
 
 
+def format_template_parameter(value: str | int | None, fallback: str) -> str:
+    cleaned = normalize_spaces(value)
+    return cleaned or fallback
+
+
+def get_status_template_name(status: str) -> str:
+    return normalize_spaces(WHATSAPP_STATUS_TEMPLATE_NAMES.get(normalize_status(status), ""))
+
+
+def build_status_template_parameters(order: dict) -> list[str]:
+    return [
+        format_template_parameter(order.get("product_name"), "Product"),
+        format_template_parameter(order.get("size"), "Standard"),
+        str(int(order.get("quantity") or 1)),
+    ]
+
+
 def get_order_customer_name(order: dict, customer_profile: dict | None = None) -> str:
     return (
         normalize_name(order.get("customer_name", ""))
         or normalize_name((customer_profile or {}).get("name", ""))
         or "Customer"
     )
+
+
+def get_customer_last_interaction_at(order: dict, customer_profile: dict | None = None) -> str:
+    return str(
+        (customer_profile or {}).get("last_customer_message_at")
+        or order.get("last_customer_message_at")
+        or ""
+    )
+
+
+def is_customer_service_window_active(last_interaction_at: str) -> bool:
+    last_interaction = parse_datetime(last_interaction_at)
+    if not last_interaction:
+        return False
+    elapsed = datetime.now(timezone.utc) - last_interaction.astimezone(timezone.utc)
+    return elapsed.total_seconds() <= CUSTOMER_SERVICE_WINDOW_HOURS * 3600
 
 
 def build_order_status_message(order: dict, status: str, customer_profile: dict | None = None) -> str:
@@ -1346,6 +1482,8 @@ def fetch_order_by_id(client: Client, order_id: str) -> dict | None:
 def should_retry_notification(log_entry: dict) -> bool:
     if log_entry.get("notification_status") != "failed":
         return False
+    if str(log_entry.get("delivery_channel") or "").lower() == "text":
+        return False
     attempt_count = int(log_entry.get("attempt_count") or 0)
     if attempt_count >= ORDER_STATUS_MAX_RETRIES:
         return False
@@ -1386,6 +1524,17 @@ def fetch_notification_log(client: Client, order_id: str, normalized_status: str
     return (response.data or [None])[0]
 
 
+def fetch_notification_log_by_message_id(client: Client, meta_message_id: str) -> dict | None:
+    response = (
+        client.table(WHATSAPP_NOTIFICATION_LOGS_TABLE)
+        .select("*")
+        .eq("meta_message_id", meta_message_id)
+        .limit(1)
+        .execute()
+    )
+    return (response.data or [None])[0]
+
+
 def reserve_notification_log(
     client: Client,
     order: dict,
@@ -1396,7 +1545,7 @@ def reserve_notification_log(
     if existing_log:
         existing_status = existing_log.get("notification_status")
         attempt_count = int(existing_log.get("attempt_count") or 0)
-        if existing_status in {"sent", "processing"}:
+        if existing_status in {"sent", "template_sent", "delivered", "pending"}:
             return None
         if existing_status == "failed" and attempt_count >= ORDER_STATUS_MAX_RETRIES:
             logger.warning(
@@ -1407,7 +1556,7 @@ def reserve_notification_log(
             return None
 
         payload = {
-            "notification_status": "processing",
+            "notification_status": "pending",
             "attempt_count": attempt_count + 1,
             "error_message": None,
             "last_attempt_at": utc_now_iso(),
@@ -1425,7 +1574,7 @@ def reserve_notification_log(
         "product_name": order.get("product_name"),
         "size": order.get("size"),
         "quantity": int(order.get("quantity") or 1),
-        "notification_status": "processing",
+        "notification_status": "pending",
         "attempt_count": 1,
         "last_attempt_at": utc_now_iso(),
     }
@@ -1443,6 +1592,7 @@ def update_notification_log(
     log_id: str,
     notification_status: str,
     error_message: str = "",
+    **extra_fields,
 ) -> None:
     payload = {
         "notification_status": notification_status,
@@ -1451,7 +1601,130 @@ def update_notification_log(
     }
     if notification_status == "sent":
         payload["sent_at"] = utc_now_iso()
+    if notification_status == "template_sent":
+        payload["sent_at"] = utc_now_iso()
+    payload.update({key: value for key, value in extra_fields.items()})
     client.table(WHATSAPP_NOTIFICATION_LOGS_TABLE).update(payload).eq("id", log_id).execute()
+
+
+def remember_customer_interaction(mobile: str, interaction_at: datetime | None = None) -> None:
+    normalized_mobile = normalize_whatsapp_phone(mobile)
+    if not normalized_mobile:
+        return
+
+    client = get_supabase_client()
+    existing_user = fetch_whatsapp_user(client, normalized_mobile) or fetch_whatsapp_user(client, mobile)
+    profile = {
+        "mobile": (existing_user or {}).get("mobile") or normalized_mobile,
+        "name": (existing_user or {}).get("name") or None,
+        "email": (existing_user or {}).get("email") or None,
+        "address": extract_default_address(existing_user),
+        "last_customer_message_at": (interaction_at or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat(),
+    }
+    if existing_user and "wishlist" in existing_user:
+        profile["wishlist"] = existing_user.get("wishlist") or []
+    if existing_user and "total_orders" in existing_user:
+        profile["total_orders"] = existing_user.get("total_orders") or 0
+
+    try:
+        upsert_whatsapp_user(client, profile)
+    except Exception as exc:
+        logger.error("Failed to persist last customer interaction for %s: %s", mobile, exc)
+
+
+async def send_status_template_notification(
+    client: Client,
+    log_entry: dict,
+    order: dict,
+    normalized_status: str,
+    normalized_mobile: str,
+    *,
+    fallback_used: bool,
+    error_context: str = "",
+) -> bool:
+    template_name = get_status_template_name(normalized_status)
+    if not template_name:
+        update_notification_log(
+            client,
+            log_entry["id"],
+            "failed",
+            error_context or f"No approved template configured for {normalized_status}",
+            delivery_channel="template",
+            template_name=None,
+            fallback_used=fallback_used,
+        )
+        return False
+
+    try:
+        response = await send_template_message(
+            normalized_mobile,
+            template_name,
+            build_status_template_parameters(order),
+        )
+        message_id = str(((response.get("messages") or [{}])[0]).get("id") or "")
+        update_notification_log(
+            client,
+            log_entry["id"],
+            "template_sent",
+            "",
+            delivery_channel="template",
+            template_name=template_name,
+            fallback_used=fallback_used,
+            meta_message_id=message_id or None,
+            meta_status="accepted",
+            meta_error_code=None,
+            meta_error_title=None,
+            meta_error_details=None,
+        )
+        notification_watcher_state["processed_count"] += 1
+        return True
+    except WhatsAppSendError as exc:
+        update_notification_log(
+            client,
+            log_entry["id"],
+            "failed",
+            str(exc),
+            delivery_channel="template",
+            template_name=template_name,
+            fallback_used=fallback_used,
+            meta_status="failed",
+            meta_error_code=exc.error_code,
+            meta_error_title=exc.error_title or None,
+            meta_error_details=exc.error_details or None,
+        )
+        return False
+
+
+async def fallback_notification_to_template(
+    client: Client,
+    log_entry: dict,
+    order: dict,
+    normalized_status: str,
+    normalized_mobile: str,
+    *,
+    error_context: str = "",
+) -> bool:
+    if str(log_entry.get("delivery_channel") or "").lower() == "template":
+        return False
+
+    update_notification_log(
+        client,
+        log_entry["id"],
+        "pending",
+        error_context,
+        fallback_used=True,
+        delivery_channel="template",
+        meta_status="retrying_with_template",
+    )
+    return await send_status_template_notification(
+        client,
+        log_entry,
+        order,
+        normalized_status,
+        normalized_mobile,
+        fallback_used=True,
+        error_context=error_context,
+    )
 
 
 async def save_profile_before_confirmation(from_number: str, user: dict | None, order_state: dict) -> bool:
@@ -1539,6 +1812,8 @@ async def send_order_status_notification(order: dict, new_status: str) -> None:
     if not message:
         logger.info("No status template configured for %s", normalized_status)
         return
+    last_interaction_at = get_customer_last_interaction_at(order, customer_profile)
+    session_active = is_customer_service_window_active(last_interaction_at)
 
     try:
         log_entry = reserve_notification_log(client, order, normalized_status, normalized_mobile)
@@ -1550,14 +1825,70 @@ async def send_order_status_notification(order: dict, new_status: str) -> None:
         logger.info("Duplicate or exhausted notification skipped for order %s status %s", order.get("id"), normalized_status)
         return
 
+    update_notification_log(
+        client,
+        log_entry["id"],
+        "pending",
+        "",
+        last_customer_message_at=last_interaction_at or None,
+        customer_service_window_active=session_active,
+        fallback_used=bool(log_entry.get("fallback_used")),
+    )
+
+    if not session_active:
+        await send_status_template_notification(
+            client,
+            log_entry,
+            order,
+            normalized_status,
+            normalized_mobile,
+            fallback_used=bool(log_entry.get("fallback_used")),
+            error_context="Sent via template because customer service window expired",
+        )
+        return
+
     try:
-        await send_text_message(normalized_mobile, message)
-        update_notification_log(client, log_entry["id"], "sent")
+        response = await send_text_message(normalized_mobile, message)
+        message_id = str(((response.get("messages") or [{}])[0]).get("id") or "")
+        update_notification_log(
+            client,
+            log_entry["id"],
+            "sent",
+            "",
+            delivery_channel="text",
+            template_name=None,
+            fallback_used=False,
+            meta_message_id=message_id or None,
+            meta_status="accepted",
+            meta_error_code=None,
+            meta_error_title=None,
+            meta_error_details=None,
+        )
         notification_watcher_state["processed_count"] += 1
-    except Exception as exc:
+    except WhatsAppSendError as exc:
         logger.error("Order status notification failed for order %s: %s", order.get("id"), exc)
+        if exc.error_code == 131047:
+            await fallback_notification_to_template(
+                client,
+                log_entry,
+                order,
+                normalized_status,
+                normalized_mobile,
+                error_context=exc.error_details or exc.error_title or str(exc),
+            )
+            return
         try:
-            update_notification_log(client, log_entry["id"], "failed", str(exc))
+            update_notification_log(
+                client,
+                log_entry["id"],
+                "failed",
+                str(exc),
+                delivery_channel="text",
+                meta_status="failed",
+                meta_error_code=exc.error_code,
+                meta_error_title=exc.error_title or None,
+                meta_error_details=exc.error_details or None,
+            )
         except Exception as update_exc:
             logger.error("Failed to update notification log for order %s: %s", order.get("id"), update_exc)
 
@@ -1614,6 +1945,82 @@ async def poll_order_status_updates() -> None:
             logger.error("Order status watcher error: %s", exc)
 
         await asyncio.sleep(ORDER_STATUS_POLL_INTERVAL_SECONDS)
+
+
+async def handle_whatsapp_status_updates(statuses: list[dict]) -> dict:
+    client = get_supabase_client()
+    processed = 0
+
+    for status_event in statuses:
+        meta_message_id = str(status_event.get("id") or "")
+        if not meta_message_id:
+            continue
+
+        log_entry = fetch_notification_log_by_message_id(client, meta_message_id)
+        if not log_entry:
+            continue
+
+        processed += 1
+        status_value = normalize_lookup(status_event.get("status", "")).replace(" ", "_")
+        errors = status_event.get("errors") or []
+        error_payload = errors[0] if errors else {}
+        error_code = error_payload.get("code")
+        error_title = str(error_payload.get("title") or error_payload.get("message") or "")
+        error_details = str(error_payload.get("error_data", {}).get("details") or "")
+
+        if status_value == "delivered":
+            update_notification_log(
+                client,
+                log_entry["id"],
+                "delivered",
+                "",
+                meta_status="delivered",
+                meta_error_code=None,
+                meta_error_title=None,
+                meta_error_details=None,
+            )
+            continue
+
+        if status_value == "sent":
+            next_status = "template_sent" if str(log_entry.get("delivery_channel") or "").lower() == "template" else "sent"
+            update_notification_log(
+                client,
+                log_entry["id"],
+                next_status,
+                "",
+                meta_status="sent",
+                meta_error_code=None,
+                meta_error_title=None,
+                meta_error_details=None,
+            )
+            continue
+
+        if status_value == "failed":
+            update_notification_log(
+                client,
+                log_entry["id"],
+                "failed",
+                error_details or error_title or "WhatsApp delivery failed",
+                meta_status="failed",
+                meta_error_code=error_code,
+                meta_error_title=error_title or None,
+                meta_error_details=error_details or None,
+            )
+
+            normalized_status = normalize_status(log_entry.get("order_status", ""))
+            normalized_mobile = normalize_whatsapp_phone(log_entry.get("normalized_mobile") or log_entry.get("user_mobile", ""))
+            order = fetch_order_by_id(client, log_entry.get("order_id"))
+            if error_code == 131047 and order:
+                await fallback_notification_to_template(
+                    client,
+                    log_entry,
+                    order,
+                    normalized_status,
+                    normalized_mobile,
+                    error_context=error_details or error_title or "24-hour session expired",
+                )
+
+    return {"status": "status_updates_processed", "count": processed}
 
 
 @asynccontextmanager
@@ -1708,7 +2115,7 @@ async def receive_message(request: Request):
 
         value = changes[0].get("value", {})
         if "statuses" in value:
-            return {"status": "status_update_ignored"}
+            return await handle_whatsapp_status_updates(value.get("statuses", []))
 
         messages = value.get("messages", [])
         if not messages:
@@ -1717,6 +2124,7 @@ async def receive_message(request: Request):
         message = messages[0]
         from_number = message.get("from")
         message_type = message.get("type")
+        remember_customer_interaction(from_number, parse_meta_timestamp(message.get("timestamp")))
 
         if message_type != "text":
             await send_text_message(

@@ -60,6 +60,15 @@ ORDER_STATUS_POLL_BATCH_SIZE=50
 ORDER_STATUS_MAX_RETRIES=3
 ORDER_STATUS_RETRY_DELAY_SECONDS=30
 ORDER_STATUS_BACKFILL_ON_START=false
+WHATSAPP_TEMPLATE_LANGUAGE_CODE=en
+CUSTOMER_SERVICE_WINDOW_HOURS=24
+WHATSAPP_TEMPLATE_PENDING=order_pending
+WHATSAPP_TEMPLATE_CONFIRMED=order_confirmed
+WHATSAPP_TEMPLATE_PROCESSING=order_processing
+WHATSAPP_TEMPLATE_SHIPPED=order_shipped
+WHATSAPP_TEMPLATE_DELIVERED=order_delivered
+WHATSAPP_TEMPLATE_COMPLETED=order_completed
+WHATSAPP_TEMPLATE_CANCELLED=order_cancelled
 ```
 
 ### Notes
@@ -149,12 +158,14 @@ The bot can handle:
 5. Responses are sent back through the WhatsApp Cloud API.
 6. User profiles and orders are stored in Supabase.
 7. A background watcher polls `whatsapp_orders.updated_at`, sends the right WhatsApp template when `order_status` changes, and records the result in `whatsapp_notification_logs`.
+8. Order notifications use free-form text only inside the 24-hour customer service window. Outside that window, the app sends approved WhatsApp templates automatically.
 
 ## Important Behavior
 
 - Only text messages are processed.
 - Duplicate WhatsApp message IDs are ignored in memory during runtime.
 - Duplicate order status notifications are blocked at the database level with a unique `(order_id, order_status)` log key.
+- Delivery webhook statuses are processed so `sent`, `delivered`, `failed`, template fallback, and Meta error details are stored in `whatsapp_notification_logs`.
 - Product replies are capped at 5 items.
 - Cart and order session state is stored in memory, so restarting the app clears active conversation state.
 

@@ -38,6 +38,9 @@ end $$;
 alter table public.whatsapp_users
   alter column wishlist set default '[]'::jsonb;
 
+alter table public.whatsapp_users
+  add column if not exists last_customer_message_at timestamp with time zone null;
+
 create table if not exists public.whatsapp_orders (
   id uuid not null default gen_random_uuid(),
   user_mobile text not null,
@@ -63,6 +66,16 @@ create table if not exists public.whatsapp_notification_logs (
   size text null,
   quantity integer not null default 1,
   notification_status text not null default 'processing',
+  delivery_channel text null,
+  template_name text null,
+  fallback_used boolean not null default false,
+  customer_service_window_active boolean null,
+  last_customer_message_at timestamp with time zone null,
+  meta_message_id text null,
+  meta_status text null,
+  meta_error_code bigint null,
+  meta_error_title text null,
+  meta_error_details text null,
   error_message text null,
   attempt_count integer not null default 1,
   last_attempt_at timestamp with time zone not null default now(),
@@ -72,6 +85,25 @@ create table if not exists public.whatsapp_notification_logs (
   constraint whatsapp_notification_logs_pkey primary key (id),
   constraint whatsapp_notification_logs_order_status_key unique (order_id, order_status)
 );
+
+alter table public.whatsapp_notification_logs
+  add column if not exists delivery_channel text null,
+  add column if not exists template_name text null,
+  add column if not exists fallback_used boolean not null default false,
+  add column if not exists customer_service_window_active boolean null,
+  add column if not exists last_customer_message_at timestamp with time zone null,
+  add column if not exists meta_message_id text null,
+  add column if not exists meta_status text null,
+  add column if not exists meta_error_code bigint null,
+  add column if not exists meta_error_title text null,
+  add column if not exists meta_error_details text null;
+
+alter table public.whatsapp_notification_logs
+  alter column notification_status set default 'pending';
+
+create unique index if not exists whatsapp_notification_logs_meta_message_id_key
+  on public.whatsapp_notification_logs (meta_message_id)
+  where meta_message_id is not null;
 
 create or replace function public.set_row_updated_at()
 returns trigger
